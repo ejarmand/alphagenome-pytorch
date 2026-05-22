@@ -58,7 +58,12 @@ def __getattr__(name):
                 "compute_track_means", "MultimodalDataset", "collate_multimodal"):
         from alphagenome_pytorch.extensions.finetuning import datasets
         return getattr(datasets, name)
-    if name in ("BaskervilleTFRecordDataset", "collate_tfr_genomic"):
+    if name in (
+        "BaskervilleTFRecordDataset",
+        "BaskervilleMultiTFRecordDataset",
+        "collate_tfr_genomic",
+        "collate_tfr_multimodal",
+    ):
         from alphagenome_pytorch.extensions.finetuning import tfrecord_dataset
         return getattr(tfrecord_dataset, name)
     if name in (
@@ -90,7 +95,9 @@ __all__ = [
     "CachedGenome",
     "compute_track_means",
     "BaskervilleTFRecordDataset",
+    "BaskervilleMultiTFRecordDataset",
     "collate_tfr_genomic",
+    "collate_tfr_multimodal",
     # Adapters
     "LoRA",
     "Locon",

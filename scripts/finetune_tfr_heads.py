@@ -20,7 +20,8 @@ from alphagenome_pytorch.config import DtypePolicy
 from alphagenome_pytorch.extensions.finetuning.heads import create_finetuning_head
 from alphagenome_pytorch.extensions.finetuning.tfrecord_dataset import (
     BaskervilleTFRecordDataset,
-    collate_tfr_genomic,
+    BaskervilleMultiTFRecordDataset,
+    collate_tfr_multimodal,
 )
 from alphagenome_pytorch.extensions.finetuning.transfer import load_trunk, remove_all_heads
 from alphagenome_pytorch.losses import multinomial_loss
@@ -33,7 +34,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--pretrained-weights", type=Path)
-    parser.add_argument("--modality", default="RNA")
+    parser.add_argument(
+        "--modality",
+        action="append",
+        default=None,
+        help=(
+            "Modality to train. Repeat for multiple heads, or omit/use 'all' "
+            "to train all modalities in targets.txt."
+        ),
+    )
     parser.add_argument("--pooling", choices=["mean", "sum"], default="mean")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=1)
@@ -67,16 +76,16 @@ def parse_args() -> argparse.Namespace:
 def create_tfr_dataset(
     data_dir: Path,
     split: str,
-    modality: str,
+    modalities: list[str],
     pooling: str,
     *,
     repeat: bool = False,
     shuffle_files: bool = False,
-) -> BaskervilleTFRecordDataset:
-    return BaskervilleTFRecordDataset(
+) -> BaskervilleMultiTFRecordDataset:
+    return BaskervilleMultiTFRecordDataset(
         data_dir,
         split=split,  # type: ignore[arg-type]
-        modality=modality,
+        modalities=modalities,
         pooling=pooling,  # type: ignore[arg-type]
         repeat=repeat,
         shuffle_files=shuffle_files,
@@ -84,7 +93,7 @@ def create_tfr_dataset(
 
 
 def create_loader(
-    dataset: BaskervilleTFRecordDataset,
+    dataset: BaskervilleMultiTFRecordDataset,
     batch_size: int,
     num_workers: int,
 ) -> DataLoader:
@@ -92,7 +101,7 @@ def create_loader(
         dataset,
         batch_size=batch_size,
         num_workers=num_workers,
-        collate_fn=collate_tfr_genomic,
+        collate_fn=collate_tfr_multimodal,
         pin_memory=torch.cuda.is_available(),
         prefetch_factor=2 if num_workers > 0 else None,
         persistent_workers=num_workers > 0,
@@ -102,30 +111,43 @@ def create_loader(
 @torch.no_grad()
 def estimate_track_means(
     data_dir: Path,
-    modality: str,
+    modalities: list[str],
     pooling: str,
     max_samples: int,
     batch_size: int,
     num_workers: int,
-) -> torch.Tensor:
-    dataset = create_tfr_dataset(data_dir, "train", modality, pooling)
+) -> dict[str, torch.Tensor]:
+    dataset = create_tfr_dataset(data_dir, "train", modalities, pooling)
     if max_samples <= 0:
-        return torch.ones(1, dataset.n_tracks)
+        return {
+            modality: torch.ones(1, len(dataset.target_indices_by_modality[modality]))
+            for modality in dataset.modalities
+        }
 
     loader = create_loader(dataset, batch_size=batch_size, num_workers=num_workers)
-    sums = torch.zeros(dataset.n_tracks, dtype=torch.float64)
-    count = 0
+    sums = {
+        modality: torch.zeros(len(indices), dtype=torch.float64)
+        for modality, indices in dataset.target_indices_by_modality.items()
+    }
+    position_counts = {modality: 0 for modality in dataset.modalities}
+    samples_seen = 0
 
-    for sequences, targets in loader:
+    for sequences, modality_targets in loader:
         del sequences
-        target = targets[128].double()
-        sums += target.sum(dim=(0, 1))
-        count += target.shape[0] * target.shape[1]
-        if count >= max_samples * target.shape[1]:
+        for modality, targets in modality_targets.items():
+            target = targets[128].double()
+            sums[modality] += target.sum(dim=(0, 1))
+            position_counts[modality] += target.shape[0] * target.shape[1]
+        samples_seen += next(iter(modality_targets.values()))[128].shape[0]
+        if samples_seen >= max_samples:
             break
 
-    means = (sums / max(1, count)).float().clamp_min(1e-6)
-    return means.unsqueeze(0)
+    return {
+        modality: (
+            sums[modality] / max(1, position_counts[modality])
+        ).float().clamp_min(1e-6).unsqueeze(0)
+        for modality in dataset.modalities
+    }
 
 
 def crop_predictions(pred: torch.Tensor, crop_bins: int) -> torch.Tensor:
@@ -217,15 +239,15 @@ def compute_loss(
     raise ValueError(f"Unknown loss: {loss_name}")
 
 
-def forward_head(
+def forward_heads(
     model: torch.nn.Module,
-    head: torch.nn.Module,
+    heads: torch.nn.ModuleDict,
     sequences: torch.Tensor,
     organism_idx: torch.Tensor,
     crop_bins: int,
     use_amp: bool,
     return_scaled: bool,
-) -> torch.Tensor:
+) -> dict[str, torch.Tensor]:
     amp_context = autocast_context(sequences.device, use_amp)
     with torch.no_grad():
         with amp_context:
@@ -238,19 +260,25 @@ def forward_head(
                 embeddings_only=True,
             )
             embeddings = {128: outputs["embeddings_128bp"].detach()}
+    predictions_by_modality = {}
     with amp_context:
-        predictions = head(
-            embeddings,
-            organism_idx,
-            return_scaled=return_scaled,
-            channels_last=True,
-        )
-    return crop_predictions(predictions[128], crop_bins)
+        for modality, head in heads.items():
+            predictions = head(
+                embeddings,
+                organism_idx,
+                return_scaled=return_scaled,
+                channels_last=True,
+            )
+            predictions_by_modality[modality] = crop_predictions(
+                predictions[128],
+                crop_bins,
+            )
+    return predictions_by_modality
 
 
 def run_epoch(
     model: torch.nn.Module,
-    head: torch.nn.Module,
+    heads: torch.nn.ModuleDict,
     loader: DataLoader,
     device: torch.device,
     optimizer: torch.optim.Optimizer | None,
@@ -259,40 +287,45 @@ def run_epoch(
     max_steps: int | None,
 ) -> float:
     training = optimizer is not None
-    head.train(training)
+    heads.train(training)
     model.eval()
     total_loss = 0.0
     steps = 0
     pbar = tqdm(loader, desc="train" if training else "valid")
 
-    for sequences, targets in pbar:
+    for sequences, modality_targets in pbar:
         sequences = sequences.to(device, non_blocking=True)
-        target = targets[128].to(device, non_blocking=True)
         organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
 
-        pred = forward_head(
+        predictions_by_modality = forward_heads(
             model,
-            head,
+            heads,
             sequences,
             organism_idx,
             crop_bins,
             use_amp=not args.no_amp,
             return_scaled=args.loss in ("poisson-multinomial", "multinomial"),
         )
-        if pred.shape != target.shape:
-            raise ValueError(
-                f"Prediction shape {tuple(pred.shape)} does not match target "
-                f"shape {tuple(target.shape)} after crop_bins={crop_bins}"
+        loss = torch.tensor(0.0, device=device)
+        loss_by_modality = {}
+        for modality, pred in predictions_by_modality.items():
+            target = modality_targets[modality][128].to(device, non_blocking=True)
+            if pred.shape != target.shape:
+                raise ValueError(
+                    f"{modality}: prediction shape {tuple(pred.shape)} does not "
+                    f"match target shape {tuple(target.shape)} after crop_bins={crop_bins}"
+                )
+            modality_loss = compute_loss(
+                pred,
+                target,
+                loss_name=args.loss,
+                head=heads[modality],
+                organism_idx=organism_idx,
+                positional_weight=args.positional_weight,
+                count_weight=args.count_weight,
             )
-        loss = compute_loss(
-            pred,
-            target,
-            loss_name=args.loss,
-            head=head,
-            organism_idx=organism_idx,
-            positional_weight=args.positional_weight,
-            count_weight=args.count_weight,
-        )
+            loss = loss + modality_loss
+            loss_by_modality[modality] = modality_loss.item()
 
         if training:
             optimizer.zero_grad(set_to_none=True)
@@ -301,7 +334,12 @@ def run_epoch(
 
         total_loss += loss.item()
         steps += 1
-        pbar.set_postfix(loss=f"{loss.item():.4f}")
+        postfix = {"loss": f"{loss.item():.4f}"}
+        postfix.update({
+            modality: f"{modality_loss:.4f}"
+            for modality, modality_loss in loss_by_modality.items()
+        })
+        pbar.set_postfix(postfix)
         if max_steps is not None and steps >= max_steps:
             break
 
@@ -310,27 +348,37 @@ def run_epoch(
 
 def save_checkpoint(
     path: Path,
-    head: torch.nn.Module,
+    heads: torch.nn.ModuleDict,
     metadata: dict[str, Any],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"head_state_dict": head.state_dict(), "metadata": metadata}, path)
+    torch.save({"heads_state_dict": heads.state_dict(), "metadata": metadata}, path)
+
+
+def resolve_modalities(args: argparse.Namespace) -> list[str]:
+    requested = args.modality or ["all"]
+    if len(requested) == 1 and requested[0].lower() == "all":
+        return BaskervilleTFRecordDataset.available_modalities(args.data_dir)
+    if any(modality.lower() == "all" for modality in requested):
+        raise ValueError("Use either --modality all or explicit repeated --modality values")
+    return requested
 
 
 def main() -> None:
     args = parse_args()
     torch.backends.cuda.matmul.allow_tf32 = True
     device = resolve_device(args.device)
+    modalities = resolve_modalities(args)
 
     train_dataset = create_tfr_dataset(
         args.data_dir,
         "train",
-        args.modality,
+        modalities,
         args.pooling,
         repeat=False,
         shuffle_files=True,
     )
-    val_dataset = create_tfr_dataset(args.data_dir, "valid", args.modality, args.pooling)
+    val_dataset = create_tfr_dataset(args.data_dir, "valid", modalities, args.pooling)
 
     train_loader = create_loader(train_dataset, args.batch_size, args.num_workers)
     val_loader = create_loader(val_dataset, args.batch_size, args.num_workers)
@@ -339,10 +387,13 @@ def main() -> None:
     print(
         "Loader OK:",
         f"seq={tuple(sample_sequences.shape)}",
-        f"target_128={tuple(sample_targets[128].shape)}",
-        f"tracks={train_dataset.n_tracks}",
+        "targets="
+        + ",".join(
+            f"{modality}:{tuple(targets[128].shape)}"
+            for modality, targets in sample_targets.items()
+        ),
         f"crop_bins={train_dataset.prediction_crop_128bp}",
-        f"assay={train_dataset.assay_type}",
+        f"modalities={modalities}",
     )
     if args.loader_only:
         return
@@ -360,13 +411,19 @@ def main() -> None:
     print("Estimating track means...")
     track_means = estimate_track_means(
         args.data_dir,
-        args.modality,
+        modalities,
         args.pooling,
         args.track_means_samples,
         args.batch_size,
         args.num_workers,
     )
-    print(f"Track means: mean={track_means.mean().item():.6g}")
+    print(
+        "Track means:",
+        ", ".join(
+            f"{modality}={means.mean().item():.6g}"
+            for modality, means in track_means.items()
+        ),
+    )
 
     model = AlphaGenome(dtype_policy=dtype_policy)
     model = load_trunk(model, str(args.pretrained_weights), exclude_heads=True)
@@ -375,26 +432,38 @@ def main() -> None:
     for param in model.parameters():
         param.requires_grad = False
 
-    head = create_finetuning_head(
-        assay_type=train_dataset.assay_type,
-        n_tracks=train_dataset.n_tracks,
-        resolutions=(128,),
-        num_organisms=1,
-        track_means=track_means,
-    ).to(device)
+    heads = torch.nn.ModuleDict()
+    for modality in modalities:
+        heads[modality] = create_finetuning_head(
+            assay_type=train_dataset.assay_type_by_modality[modality],
+            n_tracks=len(train_dataset.target_indices_by_modality[modality]),
+            resolutions=(128,),
+            num_organisms=1,
+            track_means=track_means[modality],
+        )
+    heads = heads.to(device)
 
-    optimizer = torch.optim.AdamW(head.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(heads.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     run_name = args.run_name or datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = args.output_dir / run_name
     output_dir.mkdir(parents=True, exist_ok=True)
     metadata = {
         "data_dir": str(args.data_dir),
-        "modality": args.modality,
-        "assay_type": train_dataset.assay_type,
+        "modalities": modalities,
+        "assay_types": train_dataset.assay_type_by_modality,
         "pooling": args.pooling,
-        "n_tracks": train_dataset.n_tracks,
-        "track_names": [row.get("identifier", "") for row in train_dataset.target_rows],
+        "n_tracks": {
+            modality: len(train_dataset.target_indices_by_modality[modality])
+            for modality in modalities
+        },
+        "track_names": {
+            modality: [
+                row.get("identifier", "")
+                for row in train_dataset.target_rows_by_modality[modality]
+            ]
+            for modality in modalities
+        },
         "crop_bins_128bp": train_dataset.prediction_crop_128bp,
         "target_length_128bp": train_dataset.output_length_128bp,
         "loss": args.loss,
@@ -407,7 +476,7 @@ def main() -> None:
         print(f"Epoch {epoch}/{args.epochs}")
         train_loss = run_epoch(
             model,
-            head,
+            heads,
             train_loader,
             device,
             optimizer,
@@ -417,7 +486,7 @@ def main() -> None:
         )
         val_loss = run_epoch(
             model,
-            head,
+            heads,
             val_loader,
             device,
             None,
@@ -426,10 +495,10 @@ def main() -> None:
             args.max_val_steps,
         )
         print(f"epoch={epoch} train_loss={train_loss:.6f} val_loss={val_loss:.6f}")
-        save_checkpoint(output_dir / "last_head.pt", head, {**metadata, "epoch": epoch})
+        save_checkpoint(output_dir / "last_heads.pt", heads, {**metadata, "epoch": epoch})
         if val_loss < best_val:
             best_val = val_loss
-            save_checkpoint(output_dir / "best_head.pt", head, {**metadata, "epoch": epoch})
+            save_checkpoint(output_dir / "best_heads.pt", heads, {**metadata, "epoch": epoch})
 
 
 if __name__ == "__main__":

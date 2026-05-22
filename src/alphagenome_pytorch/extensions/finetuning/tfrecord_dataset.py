@@ -22,7 +22,12 @@ from torch.utils.data import IterableDataset, get_worker_info
 _Pooling = Literal["mean", "sum"]
 _Split = Literal["train", "valid", "test"]
 
-__all__ = ["BaskervilleTFRecordDataset", "collate_tfr_genomic"]
+__all__ = [
+    "BaskervilleTFRecordDataset",
+    "BaskervilleMultiTFRecordDataset",
+    "collate_tfr_genomic",
+    "collate_tfr_multimodal",
+]
 
 
 _MODALITY_TO_ASSAY_TYPE = {
@@ -78,6 +83,21 @@ def collate_tfr_genomic(
     """Collate samples yielded by :class:`BaskervilleTFRecordDataset`."""
     sequences = torch.stack([item[0] for item in batch], dim=0)
     targets = {128: torch.stack([item[1][128] for item in batch], dim=0)}
+    return sequences, targets
+
+
+def collate_tfr_multimodal(
+    batch: list[tuple[torch.Tensor, dict[str, dict[int, torch.Tensor]]]],
+) -> tuple[torch.Tensor, dict[str, dict[int, torch.Tensor]]]:
+    """Collate samples yielded by :class:`BaskervilleMultiTFRecordDataset`."""
+    sequences = torch.stack([item[0] for item in batch], dim=0)
+    first_targets = batch[0][1]
+    targets = {
+        modality: {
+            128: torch.stack([item[1][modality][128] for item in batch], dim=0)
+        }
+        for modality in first_targets
+    }
     return sequences, targets
 
 
@@ -220,6 +240,19 @@ class BaskervilleTFRecordDataset(IterableDataset):
             indices = [int(row["index"]) for row in selected]
         return indices, selected
 
+    @classmethod
+    def available_modalities(cls, data_dir: str | Path) -> list[str]:
+        """Return modality labels present in targets.txt in first-seen order."""
+        rows = cls._load_targets_table(Path(data_dir))
+        modalities = []
+        seen = set()
+        for row in rows:
+            modality = row.get("modality", "")
+            if modality and modality.upper() not in seen:
+                modalities.append(modality)
+                seen.add(modality.upper())
+        return modalities
+
     @staticmethod
     def _decode_sequence(sequence_bytes: bytes, seq_length: int) -> np.ndarray:
         encoded = np.frombuffer(sequence_bytes, dtype=np.uint8)
@@ -239,6 +272,11 @@ class BaskervilleTFRecordDataset(IterableDataset):
         )
 
     def _decode_target(self, target_bytes: bytes) -> np.ndarray:
+        target = self._decode_full_target(target_bytes)
+        target = target[:, self.target_indices]
+        return target.astype(np.float32, copy=False)
+
+    def _decode_full_target(self, target_bytes: bytes) -> np.ndarray:
         target = np.frombuffer(target_bytes, dtype=np.float16)
         expected = self.metadata.target_length * self.metadata.num_targets
         if target.size != expected:
@@ -247,9 +285,7 @@ class BaskervilleTFRecordDataset(IterableDataset):
                 f"expected {expected} for shape "
                 f"({self.metadata.target_length}, {self.metadata.num_targets})."
             )
-        target = target.reshape(self.metadata.target_length, self.metadata.num_targets)
-        target = target[:, self.target_indices]
-        return target.astype(np.float32, copy=False)
+        return target.reshape(self.metadata.target_length, self.metadata.num_targets)
 
     def _pool_target_128bp(self, target: np.ndarray) -> np.ndarray:
         if target.shape[0] % 4 != 0:
@@ -342,6 +378,91 @@ class BaskervilleTFRecordDataset(IterableDataset):
                     torch.from_numpy(sequence).float(),
                     {128: torch.from_numpy(target_128bp).float()},
                 )
+
+            if not self.repeat:
+                break
+
+
+class BaskervilleMultiTFRecordDataset(BaskervilleTFRecordDataset):
+    """Iterable dataset that yields targets for multiple modalities per sequence."""
+
+    def __init__(
+        self,
+        data_dir: str | Path,
+        *,
+        split: _Split = "train",
+        modalities: Iterable[str] | None = None,
+        pooling: _Pooling = "mean",
+        shuffle_files: bool = False,
+        repeat: bool = False,
+        seed: int = 0,
+        num_parallel_reads: int | None = None,
+    ):
+        if modalities is None:
+            modalities = self.available_modalities(data_dir)
+        self.modalities = list(modalities)
+        if not self.modalities:
+            raise ValueError("At least one modality is required")
+
+        super().__init__(
+            data_dir,
+            split=split,
+            modality=self.modalities[0],
+            pooling=pooling,
+            shuffle_files=shuffle_files,
+            repeat=repeat,
+            seed=seed,
+            num_parallel_reads=num_parallel_reads,
+        )
+
+        self.target_indices_by_modality: dict[str, np.ndarray] = {}
+        self.target_rows_by_modality: dict[str, list[dict[str, str]]] = {}
+        self.assay_type_by_modality: dict[str, str] = {}
+        for modality in self.modalities:
+            indices, rows = self._modality_indices(self.data_dir, modality)
+            self.target_indices_by_modality[modality] = np.asarray(indices, dtype=np.int64)
+            self.target_rows_by_modality[modality] = rows
+            key = modality.upper()
+            if key not in _MODALITY_TO_ASSAY_TYPE:
+                available = ", ".join(sorted(_MODALITY_TO_ASSAY_TYPE))
+                raise ValueError(
+                    f"Unknown TFRecord modality {modality!r}. "
+                    f"Known modalities: {available}"
+                )
+            self.assay_type_by_modality[modality] = _MODALITY_TO_ASSAY_TYPE[key]
+
+    def __iter__(self):
+        files = self._worker_files()
+        if not files:
+            return
+
+        while True:
+            dataset = self._tf_dataset(files)
+            if dataset is None:
+                return
+
+            tf = self._ensure_tensorflow_cpu()
+            feature_spec = {
+                "sequence": tf.io.FixedLenFeature([], tf.string),
+                "target": tf.io.FixedLenFeature([], tf.string),
+            }
+
+            for record in dataset:
+                parsed = tf.io.parse_single_example(record, feature_spec)
+                sequence = self._decode_sequence(
+                    parsed["sequence"].numpy(),
+                    self.metadata.seq_length,
+                )
+                full_target = self._decode_full_target(parsed["target"].numpy())
+                modality_targets = {}
+                for modality, indices in self.target_indices_by_modality.items():
+                    target = full_target[:, indices].astype(np.float32, copy=False)
+                    target_128bp = self._pool_target_128bp(target)
+                    modality_targets[modality] = {
+                        128: torch.from_numpy(target_128bp).float()
+                    }
+
+                yield torch.from_numpy(sequence).float(), modality_targets
 
             if not self.repeat:
                 break

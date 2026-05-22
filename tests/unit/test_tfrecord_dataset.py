@@ -8,8 +8,10 @@ import numpy as np
 import torch
 
 from alphagenome_pytorch.extensions.finetuning.tfrecord_dataset import (
+    BaskervilleMultiTFRecordDataset,
     BaskervilleTFRecordDataset,
     collate_tfr_genomic,
+    collate_tfr_multimodal,
 )
 from alphagenome_pytorch.extensions.finetuning.heads import create_finetuning_head
 from scripts.finetune_tfr_heads import compute_loss
@@ -55,6 +57,21 @@ def test_metadata_files_and_modality_selection(tmp_path):
     assert dataset.assay_type == "atac"
     assert dataset.prediction_crop_128bp == 1
     assert dataset.output_length_128bp == 2
+
+
+def test_multimodal_metadata_and_modality_selection(tmp_path):
+    data_dir = _write_minimal_dataset(tmp_path)
+
+    dataset = BaskervilleMultiTFRecordDataset(
+        data_dir,
+        modalities=["ATAC", "RNA"],
+    )
+
+    assert dataset.modalities == ["ATAC", "RNA"]
+    assert dataset.assay_type_by_modality == {"ATAC": "atac", "RNA": "rna_seq"}
+    assert dataset.target_indices_by_modality["ATAC"].tolist() == [0, 2]
+    assert dataset.target_indices_by_modality["RNA"].tolist() == [1]
+    assert BaskervilleTFRecordDataset.available_modalities(data_dir) == ["ATAC", "RNA"]
 
 
 def test_modality_selection_uses_row_positions_for_filtered_targets(tmp_path):
@@ -131,6 +148,28 @@ def test_collate_tfr_genomic():
     assert targets[128].shape == (2, 2, 3)
     torch.testing.assert_close(sequences[1], seq1)
     torch.testing.assert_close(targets[128][1], target1)
+
+
+def test_collate_tfr_multimodal():
+    seq0 = torch.zeros(4, 4)
+    seq1 = torch.ones(4, 4)
+    atac0 = torch.zeros(2, 3)
+    atac1 = torch.ones(2, 3)
+    rna0 = torch.full((2, 1), 2.0)
+    rna1 = torch.full((2, 1), 3.0)
+
+    sequences, targets = collate_tfr_multimodal(
+        [
+            (seq0, {"ATAC": {128: atac0}, "RNA": {128: rna0}}),
+            (seq1, {"ATAC": {128: atac1}, "RNA": {128: rna1}}),
+        ]
+    )
+
+    assert sequences.shape == (2, 4, 4)
+    assert targets["ATAC"][128].shape == (2, 2, 3)
+    assert targets["RNA"][128].shape == (2, 2, 1)
+    torch.testing.assert_close(targets["ATAC"][128][1], atac1)
+    torch.testing.assert_close(targets["RNA"][128][1], rna1)
 
 
 def test_poisson_multinomial_loss_alias_runs():
