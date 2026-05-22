@@ -11,6 +11,8 @@ from alphagenome_pytorch.extensions.finetuning.tfrecord_dataset import (
     BaskervilleTFRecordDataset,
     collate_tfr_genomic,
 )
+from alphagenome_pytorch.extensions.finetuning.heads import create_finetuning_head
+from scripts.finetune_tfr_heads import compute_loss
 
 
 def _write_minimal_dataset(tmp_path):
@@ -53,6 +55,31 @@ def test_metadata_files_and_modality_selection(tmp_path):
     assert dataset.assay_type == "atac"
     assert dataset.prediction_crop_128bp == 1
     assert dataset.output_length_128bp == 2
+
+
+def test_modality_selection_uses_row_positions_for_filtered_targets(tmp_path):
+    data_dir = _write_minimal_dataset(tmp_path)
+    (data_dir / "statistics.json").write_text(
+        json.dumps(
+            {
+                "num_targets": 2,
+                "seq_length": 8,
+                "pool_width": 32,
+                "crop_bp": 128,
+                "target_length": 8,
+                "train_seqs": 2,
+            }
+        )
+    )
+    (data_dir / "targets.txt").write_text(
+        "\t".join(["index", "identifier", "modality"]) + "\n"
+        "5\ttrack5\tRNA\n"
+        "8\ttrack8\tATAC\n"
+    )
+
+    dataset = BaskervilleTFRecordDataset(data_dir, modality="ATAC")
+
+    assert dataset.target_indices.tolist() == [1]
 
 
 def test_decode_sequence_accepts_indices_and_onehot():
@@ -105,3 +132,21 @@ def test_collate_tfr_genomic():
     torch.testing.assert_close(sequences[1], seq1)
     torch.testing.assert_close(targets[128][1], target1)
 
+
+def test_poisson_multinomial_loss_alias_runs():
+    head = create_finetuning_head("atac", n_tracks=2, resolutions=(128,))
+    organism_idx = torch.zeros(1, dtype=torch.long)
+    pred = torch.ones(1, 8, 2)
+    target = torch.ones(1, 8, 2)
+
+    loss = compute_loss(
+        pred,
+        target,
+        loss_name="poisson-multinomial",
+        head=head,
+        organism_idx=organism_idx,
+        positional_weight=5.0,
+        count_weight=1.0,
+    )
+
+    assert torch.isfinite(loss)

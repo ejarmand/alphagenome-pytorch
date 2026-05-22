@@ -47,6 +47,7 @@ finetuning = [
     "pandas",
     "tqdm",
     "pyfaidx",
+    "tensorflow",
 ]
 scoring = [
     "pyfaidx",

@@ -202,7 +202,22 @@ class BaskervilleTFRecordDataset(IterableDataset):
                 f"Available modalities: {available}"
             )
 
-        indices = [int(row["index"]) for row in selected]
+        # Some Baskerville dataset builds keep original/global target ``index``
+        # values in targets.txt after filtering tracks, while TFRecord targets
+        # are packed densely in targets.txt row order. Use explicit indices only
+        # when they fit the decoded target matrix; otherwise use row positions.
+        use_row_positions = False
+        if len(rows) == cls._load_metadata(data_dir).num_targets:
+            index_values = [int(row["index"]) for row in rows]
+            use_row_positions = max(index_values, default=-1) >= len(rows)
+
+        if use_row_positions:
+            indices = [
+                row_idx for row_idx, row in enumerate(rows)
+                if row.get("modality", "").upper() == requested
+            ]
+        else:
+            indices = [int(row["index"]) for row in selected]
         return indices, selected
 
     @staticmethod
@@ -262,7 +277,6 @@ class BaskervilleTFRecordDataset(IterableDataset):
 
     @staticmethod
     def _ensure_tensorflow_cpu():
-        os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
         os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
         try:
             import tensorflow as tf  # pylint: disable=import-outside-toplevel
