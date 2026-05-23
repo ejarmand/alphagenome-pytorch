@@ -28,6 +28,7 @@ from alphagenome_pytorch.extensions.finetuning.tfrecord_dataset import (
     BaskervilleMultiTFRecordDataset,
     collate_tfr_multimodal,
 )
+from alphagenome_pytorch.extensions.finetuning.training import create_lr_scheduler
 from alphagenome_pytorch.extensions.finetuning.transfer import load_trunk, remove_all_heads
 from alphagenome_pytorch.losses import multinomial_loss
 
@@ -55,6 +56,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=None,
+        help=(
+            "Warmup optimizer steps. Defaults to 1% of estimated optimizer steps. "
+            "Set 0 to disable warmup."
+        ),
+    )
+    parser.add_argument(
+        "--lr-schedule",
+        choices=["constant", "cosine"],
+        default="constant",
+        help="Learning rate schedule after optional warmup.",
+    )
+    parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        default=1,
+        help="Accumulate gradients over this many local batches before optimizer.step().",
+    )
+    parser.add_argument(
         "--loss",
         choices=["poisson-multinomial", "multinomial", "poisson", "mse"],
         default="poisson-multinomial",
@@ -74,6 +96,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto", help="'auto', 'cpu', 'cuda', or e.g. 'cuda:0'")
     parser.add_argument("--dtype", choices=["bfloat16", "float32"], default="bfloat16")
     parser.add_argument("--no-amp", action="store_true")
+    parser.add_argument("--wandb", action="store_true", help="Enable W&B logging on rank 0.")
+    parser.add_argument("--wandb-project", default="alphagenome-tfr-finetune")
+    parser.add_argument("--wandb-entity", default=None)
+    parser.add_argument("--wandb-run-name", default=None)
+    parser.add_argument("--wandb-tags", default=None, help="Comma-separated W&B tags.")
     parser.add_argument("--loader-only", action="store_true", help="Decode one batch and exit.")
     return parser.parse_args()
 
@@ -117,6 +144,34 @@ def create_loader(
     )
 
 
+def estimate_local_batches(
+    dataset: BaskervilleMultiTFRecordDataset,
+    batch_size: int,
+    max_steps: int | None,
+) -> int:
+    if max_steps is not None:
+        return max_steps
+    local_examples = math.ceil(len(dataset) / dataset.world_size)
+    return max(1, math.ceil(local_examples / batch_size))
+
+
+def estimate_total_optimizer_steps(
+    dataset: BaskervilleMultiTFRecordDataset,
+    batch_size: int,
+    epochs: int,
+    accumulation_steps: int,
+    max_train_steps: int | None,
+) -> int:
+    local_batches = estimate_local_batches(dataset, batch_size, max_train_steps)
+    return max(1, epochs * math.ceil(local_batches / accumulation_steps))
+
+
+def resolve_warmup_steps(warmup_steps: int | None, total_steps: int) -> int:
+    if warmup_steps is not None:
+        return warmup_steps
+    return max(1, math.ceil(total_steps * 0.01))
+
+
 class TFRHeads(nn.Module):
     """Small DDP-friendly wrapper around one 128 bp head per modality."""
 
@@ -143,22 +198,10 @@ class TFRHeads(nn.Module):
 
 
 def setup_torchrun(device_arg: str) -> tuple[int, int, int, torch.device]:
-    if dist.is_available() and not dist.is_initialized() and "RANK" in os.environ:
-        backend = (
-            "nccl"
-            if device_arg != "cpu" and torch.cuda.is_available()
-            else "gloo"
-        )
-        dist.init_process_group(backend=backend)
-
-    if dist.is_available() and dist.is_initialized():
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    else:
-        rank = 0
-        world_size = 1
-        local_rank = 0
+    launched_with_torchrun = "RANK" in os.environ
+    rank = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
     if device_arg == "auto":
         if torch.cuda.is_available() and torch.cuda.device_count() > 0:
@@ -182,6 +225,24 @@ def setup_torchrun(device_arg: str) -> tuple[int, int, int, torch.device]:
             )
         torch.cuda.set_device(index)
         device = torch.device(f"cuda:{index}")
+
+    if dist.is_available() and not dist.is_initialized() and launched_with_torchrun:
+        backend = (
+            "nccl"
+            if device.type == "cuda" and torch.cuda.is_available()
+            else "gloo"
+        )
+        if backend == "nccl":
+            try:
+                dist.init_process_group(backend=backend, device_id=device)
+            except TypeError:
+                dist.init_process_group(backend=backend)
+        else:
+            dist.init_process_group(backend=backend)
+
+    if dist.is_available() and dist.is_initialized():
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
 
     return rank, world_size, local_rank, device
 
@@ -423,6 +484,7 @@ def run_epoch(
     loader: DataLoader,
     device: torch.device,
     optimizer: torch.optim.Optimizer | None,
+    scheduler,
     args: argparse.Namespace,
     crop_bins: int,
     max_steps: int | None,
@@ -432,18 +494,37 @@ def run_epoch(
     training = optimizer is not None
     heads_model.train(training)
     model.eval()
+    if training and args.gradient_accumulation_steps < 1:
+        raise ValueError("--gradient-accumulation-steps must be >= 1")
     total_loss = torch.tensor(0.0, device=device)
     total_steps = torch.tensor(0.0, device=device)
     metric_stats: dict[str, torch.Tensor] = {}
     steps = 0
+    accumulated_steps = 0
     pbar = tqdm(
-        loader,
+        total=max_steps,
         desc="train" if training else "valid",
         disable=not is_main_process(rank),
     )
     heads = unwrap_heads(heads_model).heads
+    data_iter = iter(loader)
 
-    for sequences, modality_targets in pbar:
+    while max_steps is None or steps < max_steps:
+        try:
+            sequences, modality_targets = next(data_iter)
+            has_batch = torch.tensor(1, device=device)
+        except StopIteration:
+            sequences = None
+            modality_targets = None
+            has_batch = torch.tensor(0, device=device)
+
+        if world_size > 1:
+            dist.all_reduce(has_batch, op=dist.ReduceOp.MIN)
+        if has_batch.item() == 0:
+            break
+        if sequences is None or modality_targets is None:
+            raise RuntimeError("Local loader is exhausted but distributed batch check passed")
+
         sequences = sequences.to(device, non_blocking=True)
         organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
 
@@ -486,21 +567,37 @@ def run_epoch(
             )
 
         if training:
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
+            if accumulated_steps == 0:
+                optimizer.zero_grad(set_to_none=True)
+            (loss / args.gradient_accumulation_steps).backward()
+            accumulated_steps += 1
+            if accumulated_steps == args.gradient_accumulation_steps:
+                optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+                accumulated_steps = 0
 
         total_loss += loss.detach()
         total_steps += 1
         steps += 1
         postfix = {"loss": f"{loss.item():.4f}"}
+        if optimizer is not None:
+            postfix["lr"] = f"{optimizer.param_groups[0]['lr']:.2e}"
         postfix.update({
             modality: f"{modality_loss:.4f}"
             for modality, modality_loss in loss_by_modality.items()
         })
         pbar.set_postfix(postfix)
-        if max_steps is not None and steps >= max_steps:
-            break
+        pbar.update(1)
+
+    pbar.close()
+
+    if training and accumulated_steps > 0:
+        optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
+        optimizer.zero_grad(set_to_none=True)
 
     if world_size > 1:
         dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
@@ -548,6 +645,44 @@ def format_metrics(metrics: dict[str, float], prefix: str) -> str:
     )
 
 
+def create_wandb_run(
+    args: argparse.Namespace,
+    rank: int,
+    run_name: str,
+    config: dict[str, Any],
+):
+    if not args.wandb or not is_main_process(rank):
+        return None
+    try:
+        import wandb
+    except ImportError as exc:
+        raise ImportError(
+            "W&B logging requires the `wandb` package. Install it or omit --wandb."
+        ) from exc
+
+    tags = None
+    if args.wandb_tags:
+        tags = [tag.strip() for tag in args.wandb_tags.split(",") if tag.strip()]
+
+    return wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        name=args.wandb_run_name or run_name,
+        config=config,
+        tags=tags,
+    )
+
+
+def log_wandb(run, metrics: dict[str, float], step: int) -> None:
+    if run is not None:
+        run.log(metrics, step=step)
+
+
+def finish_wandb(run) -> None:
+    if run is not None:
+        run.finish()
+
+
 def resolve_modalities(args: argparse.Namespace) -> list[str]:
     requested = args.modality or ["all"]
     if len(requested) == 1 and requested[0].lower() == "all":
@@ -561,6 +696,7 @@ def main() -> None:
     args = parse_args()
     torch.backends.cuda.matmul.allow_tf32 = True
     rank, world_size, local_rank, device = setup_torchrun(args.device)
+    wandb_run = None
     try:
         modalities = resolve_modalities(args)
         print_rank0(f"Distributed: rank={rank} world_size={world_size}", rank)
@@ -651,13 +787,44 @@ def main() -> None:
             )
         heads_model: nn.Module = TFRHeads(heads).to(device)
         if world_size > 1:
-            device_ids = [local_rank] if device.type == "cuda" else None
-            heads_model = DDP(heads_model, device_ids=device_ids)
+            device_ids = [device.index] if device.type == "cuda" else None
+            heads_model = DDP(
+                heads_model,
+                device_ids=device_ids,
+                gradient_as_bucket_view=True,
+                static_graph=True,
+            )
 
         optimizer = torch.optim.AdamW(
             heads_model.parameters(),
             lr=args.lr,
             weight_decay=args.weight_decay,
+        )
+        total_optimizer_steps = estimate_total_optimizer_steps(
+            train_dataset,
+            args.batch_size,
+            args.epochs,
+            args.gradient_accumulation_steps,
+            args.max_train_steps,
+        )
+        warmup_steps = resolve_warmup_steps(args.warmup_steps, total_optimizer_steps)
+        scheduler = create_lr_scheduler(
+            optimizer,
+            warmup_steps=warmup_steps,
+            total_steps=total_optimizer_steps,
+            schedule=args.lr_schedule,
+        )
+        print_rank0(
+            " ".join(
+                (
+                    f"LR schedule: {args.lr_schedule}",
+                    f"warmup_steps={warmup_steps}",
+                    f"estimated_optimizer_steps={total_optimizer_steps}",
+                    f"gradient_accumulation_steps={args.gradient_accumulation_steps}",
+                    f"weight_decay={args.weight_decay}",
+                )
+            ),
+            rank,
         )
 
         run_name = args.run_name or datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -688,9 +855,22 @@ def main() -> None:
             "loss": args.loss,
             "pretrained_weights": str(args.pretrained_weights),
             "world_size": world_size,
+            "batch_size": args.batch_size,
+            "num_workers": args.num_workers,
+            "epochs": args.epochs,
+            "lr": args.lr,
+            "lr_schedule": args.lr_schedule,
+            "warmup_steps": warmup_steps,
+            "warmup_steps_arg": args.warmup_steps,
+            "estimated_optimizer_steps": total_optimizer_steps,
+            "gradient_accumulation_steps": args.gradient_accumulation_steps,
+            "weight_decay": args.weight_decay,
+            "dtype": args.dtype,
+            "use_amp": not args.no_amp,
         }
         if is_main_process(rank):
             (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
+        wandb_run = create_wandb_run(args, rank, run_name, metadata)
 
         best_val = float("inf")
         for epoch in range(1, args.epochs + 1):
@@ -701,6 +881,7 @@ def main() -> None:
                 train_loader,
                 device,
                 optimizer,
+                scheduler,
                 args,
                 train_dataset.prediction_crop_128bp,
                 args.max_train_steps,
@@ -713,12 +894,28 @@ def main() -> None:
                 val_loader,
                 device,
                 None,
+                None,
                 args,
                 val_dataset.prediction_crop_128bp,
                 args.max_val_steps,
                 rank,
                 world_size,
             )
+            epoch_log = {
+                "epoch": epoch,
+                "train/loss": train_loss,
+                "val/loss": val_loss,
+                "lr": optimizer.param_groups[0]["lr"],
+            }
+            epoch_log.update({
+                f"train/{key}": value
+                for key, value in train_metrics.items()
+            })
+            epoch_log.update({
+                f"val/{key}": value
+                for key, value in val_metrics.items()
+            })
+            log_wandb(wandb_run, epoch_log, step=epoch)
             print_rank0(
                 " ".join(
                     part for part in (
@@ -754,6 +951,7 @@ def main() -> None:
                         epoch_metadata,
                     )
     finally:
+        finish_wandb(wandb_run)
         cleanup_torchrun()
 
 
