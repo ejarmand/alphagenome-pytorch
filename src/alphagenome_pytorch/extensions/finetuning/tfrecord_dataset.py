@@ -17,6 +17,7 @@ from typing import Iterable, Literal
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from torch.utils.data import IterableDataset, get_worker_info
 
 _Pooling = Literal["mean", "sum"]
@@ -121,10 +122,18 @@ class BaskervilleTFRecordDataset(IterableDataset):
         repeat: bool = False,
         seed: int = 0,
         num_parallel_reads: int | None = None,
+        rank: int = 0,
+        world_size: int = 1,
     ):
         super().__init__()
         if pooling not in ("mean", "sum"):
             raise ValueError(f"pooling must be 'mean' or 'sum', got {pooling!r}")
+        if rank < 0:
+            raise ValueError(f"rank must be >= 0, got {rank}")
+        if world_size < 1:
+            raise ValueError(f"world_size must be >= 1, got {world_size}")
+        if rank >= world_size:
+            raise ValueError(f"rank={rank} must be < world_size={world_size}")
 
         self.data_dir = Path(data_dir)
         self.split = split
@@ -134,6 +143,8 @@ class BaskervilleTFRecordDataset(IterableDataset):
         self.repeat = repeat
         self.seed = seed
         self.num_parallel_reads = num_parallel_reads
+        self.rank = rank
+        self.world_size = world_size
 
         self.metadata = self._load_metadata(self.data_dir)
         self.files = self._get_tfrecord_files(self.data_dir, split)
@@ -303,10 +314,20 @@ class BaskervilleTFRecordDataset(IterableDataset):
     def _worker_files(self) -> list[Path]:
         files = list(self.files)
         worker = get_worker_info()
+        rank = self.rank
+        world_size = self.world_size
+        if dist.is_available() and dist.is_initialized():
+            rank = dist.get_rank()
+            world_size = dist.get_world_size()
         if worker is not None:
-            files = files[worker.id::worker.num_workers]
+            global_worker_id = rank * worker.num_workers + worker.id
+            global_num_workers = world_size * worker.num_workers
+            files = files[global_worker_id::global_num_workers]
+        elif world_size > 1:
+            files = files[rank::world_size]
         if self.shuffle_files:
-            shuffle_seed = self.seed + (worker.id if worker is not None else 0)
+            worker_id = worker.id if worker is not None else 0
+            shuffle_seed = self.seed + rank * 1009 + worker_id
             rng = random.Random(shuffle_seed)
             rng.shuffle(files)
         return files
@@ -397,6 +418,8 @@ class BaskervilleMultiTFRecordDataset(BaskervilleTFRecordDataset):
         repeat: bool = False,
         seed: int = 0,
         num_parallel_reads: int | None = None,
+        rank: int = 0,
+        world_size: int = 1,
     ):
         if modalities is None:
             modalities = self.available_modalities(data_dir)
@@ -413,6 +436,8 @@ class BaskervilleMultiTFRecordDataset(BaskervilleTFRecordDataset):
             repeat=repeat,
             seed=seed,
             num_parallel_reads=num_parallel_reads,
+            rank=rank,
+            world_size=world_size,
         )
 
         self.target_indices_by_modality: dict[str, np.ndarray] = {}

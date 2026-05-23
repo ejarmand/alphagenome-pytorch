@@ -5,13 +5,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import os
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import torch
+import torch.distributed as dist
+import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -81,6 +86,8 @@ def create_tfr_dataset(
     *,
     repeat: bool = False,
     shuffle_files: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> BaskervilleMultiTFRecordDataset:
     return BaskervilleMultiTFRecordDataset(
         data_dir,
@@ -89,6 +96,8 @@ def create_tfr_dataset(
         pooling=pooling,  # type: ignore[arg-type]
         repeat=repeat,
         shuffle_files=shuffle_files,
+        rank=rank,
+        world_size=world_size,
     )
 
 
@@ -106,6 +115,103 @@ def create_loader(
         prefetch_factor=2 if num_workers > 0 else None,
         persistent_workers=num_workers > 0,
     )
+
+
+class TFRHeads(nn.Module):
+    """Small DDP-friendly wrapper around one 128 bp head per modality."""
+
+    def __init__(self, heads: dict[str, nn.Module]):
+        super().__init__()
+        self.heads = nn.ModuleDict(heads)
+
+    def forward(
+        self,
+        embeddings: dict[int, torch.Tensor],
+        organism_idx: torch.Tensor,
+        *,
+        return_scaled: bool,
+    ) -> dict[str, torch.Tensor]:
+        return {
+            modality: head(
+                embeddings,
+                organism_idx,
+                return_scaled=return_scaled,
+                channels_last=True,
+            )[128]
+            for modality, head in self.heads.items()
+        }
+
+
+def setup_torchrun(device_arg: str) -> tuple[int, int, int, torch.device]:
+    if dist.is_available() and not dist.is_initialized() and "RANK" in os.environ:
+        backend = (
+            "nccl"
+            if device_arg != "cpu" and torch.cuda.is_available()
+            else "gloo"
+        )
+        dist.init_process_group(backend=backend)
+
+    if dist.is_available() and dist.is_initialized():
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    else:
+        rank = 0
+        world_size = 1
+        local_rank = 0
+
+    if device_arg == "auto":
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            device = torch.device(f"cuda:{local_rank}")
+        else:
+            device = torch.device("cpu")
+    else:
+        device = torch.device(device_arg)
+
+    if device.type == "cuda":
+        if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
+            raise RuntimeError(
+                f"Requested {device}, but CUDA is not available to PyTorch. "
+                "Use --device cpu or run on a GPU-visible node."
+            )
+        index = local_rank if device.index is None and world_size > 1 else (device.index or 0)
+        if index >= torch.cuda.device_count():
+            raise RuntimeError(
+                f"Requested cuda:{index}, but only {torch.cuda.device_count()} CUDA "
+                "device(s) are visible."
+            )
+        torch.cuda.set_device(index)
+        device = torch.device(f"cuda:{index}")
+
+    return rank, world_size, local_rank, device
+
+
+def cleanup_torchrun() -> None:
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process(rank: int) -> bool:
+    return rank == 0
+
+
+def print_rank0(message: str, rank: int) -> None:
+    if is_main_process(rank):
+        print(message)
+
+
+def broadcast_object(obj: Any, src: int = 0) -> Any:
+    if not (dist.is_available() and dist.is_initialized()):
+        return obj
+    objects = [obj]
+    dist.broadcast_object_list(objects, src=src)
+    return objects[0]
+
+
+def unwrap_heads(heads_model: nn.Module) -> TFRHeads:
+    if isinstance(heads_model, DDP):
+        return heads_model.module  # type: ignore[return-value]
+    return heads_model  # type: ignore[return-value]
 
 
 @torch.no_grad()
@@ -160,33 +266,6 @@ def crop_predictions(pred: torch.Tensor, crop_bins: int) -> torch.Tensor:
     return pred[:, crop_bins:-crop_bins, :]
 
 
-def resolve_device(device_arg: str) -> torch.device:
-    if device_arg == "auto":
-        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
-            device = torch.device("cuda:0")
-        else:
-            device = torch.device("cpu")
-    else:
-        device = torch.device(device_arg)
-
-    if device.type == "cuda":
-        if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
-            raise RuntimeError(
-                f"Requested {device}, but CUDA is not available to PyTorch. "
-                "Use --device cpu or run on a GPU-visible node."
-            )
-        index = 0 if device.index is None else device.index
-        if index >= torch.cuda.device_count():
-            raise RuntimeError(
-                f"Requested {device}, but only {torch.cuda.device_count()} CUDA "
-                "device(s) are visible."
-            )
-        torch.cuda.set_device(index)
-        return torch.device(f"cuda:{index}")
-
-    return device
-
-
 def autocast_context(device: torch.device, use_amp: bool):
     if not use_amp or device.type != "cuda":
         return nullcontext()
@@ -239,15 +318,63 @@ def compute_loss(
     raise ValueError(f"Unknown loss: {loss_name}")
 
 
+def new_metric_stats(device: torch.device) -> torch.Tensor:
+    # n, sum_pred, sum_true, sum_pred2, sum_true2, sum_pred_true, sum_squared_error
+    return torch.zeros(7, dtype=torch.float64, device=device)
+
+
+@torch.no_grad()
+def update_metric_stats(
+    stats: torch.Tensor,
+    pred: torch.Tensor,
+    target: torch.Tensor,
+) -> None:
+    pred = pred.detach().double()
+    target = target.detach().double()
+    diff = pred - target
+
+    stats[0] += pred.numel()
+    stats[1] += pred.sum()
+    stats[2] += target.sum()
+    stats[3] += pred.square().sum()
+    stats[4] += target.square().sum()
+    stats[5] += (pred * target).sum()
+    stats[6] += diff.square().sum()
+
+
+def compute_regression_metrics(stats: torch.Tensor) -> dict[str, float]:
+    n = stats[0].clamp_min(1.0)
+    pred_var_sum = stats[3] - stats[1].square() / n
+    true_var_sum = stats[4] - stats[2].square() / n
+    covariance_sum = stats[5] - stats[1] * stats[2] / n
+
+    denominator = torch.sqrt(pred_var_sum.clamp_min(0.0) * true_var_sum.clamp_min(0.0))
+    if denominator <= 0:
+        pearson = torch.tensor(float("nan"), device=stats.device)
+    else:
+        pearson = covariance_sum / denominator
+
+    if true_var_sum <= 0:
+        r2 = torch.tensor(float("nan"), device=stats.device)
+    else:
+        r2 = 1.0 - stats[6] / true_var_sum
+
+    return {
+        "pearson_r": pearson.item(),
+        "r2": r2.item(),
+    }
+
+
 def forward_heads(
     model: torch.nn.Module,
-    heads: torch.nn.ModuleDict,
+    heads_model: nn.Module,
     sequences: torch.Tensor,
     organism_idx: torch.Tensor,
     crop_bins: int,
     use_amp: bool,
     return_scaled: bool,
-) -> dict[str, torch.Tensor]:
+    requires_grad: bool,
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     amp_context = autocast_context(sequences.device, use_amp)
     with torch.no_grad():
         with amp_context:
@@ -260,51 +387,75 @@ def forward_heads(
                 embeddings_only=True,
             )
             embeddings = {128: outputs["embeddings_128bp"].detach()}
-    predictions_by_modality = {}
-    with amp_context:
-        for modality, head in heads.items():
-            predictions = head(
+    with torch.set_grad_enabled(requires_grad):
+        with amp_context:
+            loss_predictions = heads_model(
                 embeddings,
                 organism_idx,
                 return_scaled=return_scaled,
-                channels_last=True,
             )
-            predictions_by_modality[modality] = crop_predictions(
-                predictions[128],
-                crop_bins,
-            )
-    return predictions_by_modality
+
+    with torch.no_grad():
+        if not return_scaled:
+            metric_predictions = loss_predictions
+        else:
+            with amp_context:
+                metric_predictions = unwrap_heads(heads_model)(
+                    embeddings,
+                    organism_idx,
+                    return_scaled=False,
+                )
+
+    cropped_loss_predictions = {
+        modality: crop_predictions(prediction, crop_bins)
+        for modality, prediction in loss_predictions.items()
+    }
+    cropped_metric_predictions = {
+        modality: crop_predictions(prediction, crop_bins)
+        for modality, prediction in metric_predictions.items()
+    }
+    return cropped_loss_predictions, cropped_metric_predictions
 
 
 def run_epoch(
     model: torch.nn.Module,
-    heads: torch.nn.ModuleDict,
+    heads_model: nn.Module,
     loader: DataLoader,
     device: torch.device,
     optimizer: torch.optim.Optimizer | None,
     args: argparse.Namespace,
     crop_bins: int,
     max_steps: int | None,
-) -> float:
+    rank: int,
+    world_size: int,
+) -> tuple[float, dict[str, float]]:
     training = optimizer is not None
-    heads.train(training)
+    heads_model.train(training)
     model.eval()
-    total_loss = 0.0
+    total_loss = torch.tensor(0.0, device=device)
+    total_steps = torch.tensor(0.0, device=device)
+    metric_stats: dict[str, torch.Tensor] = {}
     steps = 0
-    pbar = tqdm(loader, desc="train" if training else "valid")
+    pbar = tqdm(
+        loader,
+        desc="train" if training else "valid",
+        disable=not is_main_process(rank),
+    )
+    heads = unwrap_heads(heads_model).heads
 
     for sequences, modality_targets in pbar:
         sequences = sequences.to(device, non_blocking=True)
         organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
 
-        predictions_by_modality = forward_heads(
+        predictions_by_modality, metric_predictions_by_modality = forward_heads(
             model,
-            heads,
+            heads_model,
             sequences,
             organism_idx,
             crop_bins,
             use_amp=not args.no_amp,
             return_scaled=args.loss in ("poisson-multinomial", "multinomial"),
+            requires_grad=training,
         )
         loss = torch.tensor(0.0, device=device)
         loss_by_modality = {}
@@ -325,14 +476,22 @@ def run_epoch(
                 count_weight=args.count_weight,
             )
             loss = loss + modality_loss
-            loss_by_modality[modality] = modality_loss.item()
+            loss_by_modality[modality] = float(modality_loss.detach())
+            if modality not in metric_stats:
+                metric_stats[modality] = new_metric_stats(device)
+            update_metric_stats(
+                metric_stats[modality],
+                metric_predictions_by_modality[modality],
+                target,
+            )
 
         if training:
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
 
-        total_loss += loss.item()
+        total_loss += loss.detach()
+        total_steps += 1
         steps += 1
         postfix = {"loss": f"{loss.item():.4f}"}
         postfix.update({
@@ -343,16 +502,50 @@ def run_epoch(
         if max_steps is not None and steps >= max_steps:
             break
 
-    return total_loss / max(1, steps)
+    if world_size > 1:
+        dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_steps, op=dist.ReduceOp.SUM)
+        for stats in metric_stats.values():
+            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+
+    metrics: dict[str, float] = {}
+    for modality, stats in metric_stats.items():
+        modality_metrics = compute_regression_metrics(stats)
+        metrics[f"{modality}_pearson_r"] = modality_metrics["pearson_r"]
+        metrics[f"{modality}_r2"] = modality_metrics["r2"]
+    pearson_values = [
+        value for key, value in metrics.items()
+        if key.endswith("_pearson_r") and not math.isnan(value)
+    ]
+    r2_values = [
+        value for key, value in metrics.items()
+        if key.endswith("_r2") and not math.isnan(value)
+    ]
+    if pearson_values:
+        metrics["mean_pearson_r"] = sum(pearson_values) / len(pearson_values)
+    if r2_values:
+        metrics["mean_r2"] = sum(r2_values) / len(r2_values)
+
+    return (total_loss / total_steps.clamp_min(1)).item(), metrics
 
 
 def save_checkpoint(
     path: Path,
-    heads: torch.nn.ModuleDict,
+    heads_model: nn.Module,
     metadata: dict[str, Any],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    heads = unwrap_heads(heads_model).heads
     torch.save({"heads_state_dict": heads.state_dict(), "metadata": metadata}, path)
+
+
+def format_metrics(metrics: dict[str, float], prefix: str) -> str:
+    if not metrics:
+        return ""
+    return " ".join(
+        f"{prefix}_{key}={value:.6f}"
+        for key, value in sorted(metrics.items())
+    )
 
 
 def resolve_modalities(args: argparse.Namespace) -> list[str]:
@@ -367,138 +560,201 @@ def resolve_modalities(args: argparse.Namespace) -> list[str]:
 def main() -> None:
     args = parse_args()
     torch.backends.cuda.matmul.allow_tf32 = True
-    device = resolve_device(args.device)
-    modalities = resolve_modalities(args)
+    rank, world_size, local_rank, device = setup_torchrun(args.device)
+    try:
+        modalities = resolve_modalities(args)
+        print_rank0(f"Distributed: rank={rank} world_size={world_size}", rank)
 
-    train_dataset = create_tfr_dataset(
-        args.data_dir,
-        "train",
-        modalities,
-        args.pooling,
-        repeat=False,
-        shuffle_files=True,
-    )
-    val_dataset = create_tfr_dataset(args.data_dir, "valid", modalities, args.pooling)
-
-    train_loader = create_loader(train_dataset, args.batch_size, args.num_workers)
-    val_loader = create_loader(val_dataset, args.batch_size, args.num_workers)
-
-    sample_sequences, sample_targets = next(iter(train_loader))
-    print(
-        "Loader OK:",
-        f"seq={tuple(sample_sequences.shape)}",
-        "targets="
-        + ",".join(
-            f"{modality}:{tuple(targets[128].shape)}"
-            for modality, targets in sample_targets.items()
-        ),
-        f"crop_bins={train_dataset.prediction_crop_128bp}",
-        f"modalities={modalities}",
-    )
-    if args.loader_only:
-        return
-
-    if args.pretrained_weights is None:
-        raise SystemExit("--pretrained-weights is required unless --loader-only is set")
-
-    print(f"Device: {device}")
-    dtype_policy = (
-        DtypePolicy.full_float32()
-        if args.dtype == "float32"
-        else DtypePolicy.mixed_precision()
-    )
-
-    print("Estimating track means...")
-    track_means = estimate_track_means(
-        args.data_dir,
-        modalities,
-        args.pooling,
-        args.track_means_samples,
-        args.batch_size,
-        args.num_workers,
-    )
-    print(
-        "Track means:",
-        ", ".join(
-            f"{modality}={means.mean().item():.6g}"
-            for modality, means in track_means.items()
-        ),
-    )
-
-    model = AlphaGenome(dtype_policy=dtype_policy)
-    model = load_trunk(model, str(args.pretrained_weights), exclude_heads=True)
-    model = remove_all_heads(model).to(device)
-    model.eval()
-    for param in model.parameters():
-        param.requires_grad = False
-
-    heads = torch.nn.ModuleDict()
-    for modality in modalities:
-        heads[modality] = create_finetuning_head(
-            assay_type=train_dataset.assay_type_by_modality[modality],
-            n_tracks=len(train_dataset.target_indices_by_modality[modality]),
-            resolutions=(128,),
-            num_organisms=1,
-            track_means=track_means[modality],
+        train_dataset = create_tfr_dataset(
+            args.data_dir,
+            "train",
+            modalities,
+            args.pooling,
+            repeat=False,
+            shuffle_files=True,
+            rank=rank,
+            world_size=world_size,
         )
-    heads = heads.to(device)
-
-    optimizer = torch.optim.AdamW(heads.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-
-    run_name = args.run_name or datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = args.output_dir / run_name
-    output_dir.mkdir(parents=True, exist_ok=True)
-    metadata = {
-        "data_dir": str(args.data_dir),
-        "modalities": modalities,
-        "assay_types": train_dataset.assay_type_by_modality,
-        "pooling": args.pooling,
-        "n_tracks": {
-            modality: len(train_dataset.target_indices_by_modality[modality])
-            for modality in modalities
-        },
-        "track_names": {
-            modality: [
-                row.get("identifier", "")
-                for row in train_dataset.target_rows_by_modality[modality]
-            ]
-            for modality in modalities
-        },
-        "crop_bins_128bp": train_dataset.prediction_crop_128bp,
-        "target_length_128bp": train_dataset.output_length_128bp,
-        "loss": args.loss,
-        "pretrained_weights": str(args.pretrained_weights),
-    }
-    (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
-
-    best_val = float("inf")
-    for epoch in range(1, args.epochs + 1):
-        print(f"Epoch {epoch}/{args.epochs}")
-        train_loss = run_epoch(
-            model,
-            heads,
-            train_loader,
-            device,
-            optimizer,
-            args,
-            train_dataset.prediction_crop_128bp,
-            args.max_train_steps,
+        val_dataset = create_tfr_dataset(
+            args.data_dir,
+            "valid",
+            modalities,
+            args.pooling,
+            rank=rank,
+            world_size=world_size,
         )
-        val_loss = run_epoch(
-            model,
-            heads,
-            val_loader,
-            device,
-            None,
-            args,
-            val_dataset.prediction_crop_128bp,
-            args.max_val_steps,
+
+        train_loader = create_loader(train_dataset, args.batch_size, args.num_workers)
+        val_loader = create_loader(val_dataset, args.batch_size, args.num_workers)
+
+        sample_sequences, sample_targets = next(iter(train_loader))
+        print_rank0(
+            "Loader OK: "
+            f"seq={tuple(sample_sequences.shape)} "
+            + "targets="
+            + ",".join(
+                f"{modality}:{tuple(targets[128].shape)}"
+                for modality, targets in sample_targets.items()
+            )
+            + f" crop_bins={train_dataset.prediction_crop_128bp}"
+            + f" modalities={modalities}",
+            rank,
         )
-        print(f"epoch={epoch} train_loss={train_loss:.6f} val_loss={val_loss:.6f}")
-        save_checkpoint(output_dir / "last_heads.pt", heads, {**metadata, "epoch": epoch})
-        if val_loss < best_val:
-            best_val = val_loss
-            save_checkpoint(output_dir / "best_heads.pt", heads, {**metadata, "epoch": epoch})
+        if args.loader_only:
+            return
+
+        if args.pretrained_weights is None:
+            raise SystemExit("--pretrained-weights is required unless --loader-only is set")
+
+        print_rank0(f"Device: {device} local_rank={local_rank}", rank)
+        dtype_policy = (
+            DtypePolicy.full_float32()
+            if args.dtype == "float32"
+            else DtypePolicy.mixed_precision()
+        )
+
+        track_means = None
+        if is_main_process(rank):
+            print("Estimating track means...")
+            track_means = estimate_track_means(
+                args.data_dir,
+                modalities,
+                args.pooling,
+                args.track_means_samples,
+                args.batch_size,
+                args.num_workers,
+            )
+            print(
+                "Track means:",
+                ", ".join(
+                    f"{modality}={means.mean().item():.6g}"
+                    for modality, means in track_means.items()
+                ),
+            )
+        track_means = broadcast_object(track_means, src=0)
+
+        model = AlphaGenome(dtype_policy=dtype_policy)
+        model = load_trunk(model, str(args.pretrained_weights), exclude_heads=True)
+        model = remove_all_heads(model).to(device)
+        model.eval()
+        for param in model.parameters():
+            param.requires_grad = False
+
+        heads = {}
+        for modality in modalities:
+            heads[modality] = create_finetuning_head(
+                assay_type=train_dataset.assay_type_by_modality[modality],
+                n_tracks=len(train_dataset.target_indices_by_modality[modality]),
+                resolutions=(128,),
+                num_organisms=1,
+                track_means=track_means[modality],
+            )
+        heads_model: nn.Module = TFRHeads(heads).to(device)
+        if world_size > 1:
+            device_ids = [local_rank] if device.type == "cuda" else None
+            heads_model = DDP(heads_model, device_ids=device_ids)
+
+        optimizer = torch.optim.AdamW(
+            heads_model.parameters(),
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+        )
+
+        run_name = args.run_name or datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = args.output_dir / run_name
+        if is_main_process(rank):
+            output_dir.mkdir(parents=True, exist_ok=True)
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+
+        metadata = {
+            "data_dir": str(args.data_dir),
+            "modalities": modalities,
+            "assay_types": train_dataset.assay_type_by_modality,
+            "pooling": args.pooling,
+            "n_tracks": {
+                modality: len(train_dataset.target_indices_by_modality[modality])
+                for modality in modalities
+            },
+            "track_names": {
+                modality: [
+                    row.get("identifier", "")
+                    for row in train_dataset.target_rows_by_modality[modality]
+                ]
+                for modality in modalities
+            },
+            "crop_bins_128bp": train_dataset.prediction_crop_128bp,
+            "target_length_128bp": train_dataset.output_length_128bp,
+            "loss": args.loss,
+            "pretrained_weights": str(args.pretrained_weights),
+            "world_size": world_size,
+        }
+        if is_main_process(rank):
+            (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
+
+        best_val = float("inf")
+        for epoch in range(1, args.epochs + 1):
+            print_rank0(f"Epoch {epoch}/{args.epochs}", rank)
+            train_loss, train_metrics = run_epoch(
+                model,
+                heads_model,
+                train_loader,
+                device,
+                optimizer,
+                args,
+                train_dataset.prediction_crop_128bp,
+                args.max_train_steps,
+                rank,
+                world_size,
+            )
+            val_loss, val_metrics = run_epoch(
+                model,
+                heads_model,
+                val_loader,
+                device,
+                None,
+                args,
+                val_dataset.prediction_crop_128bp,
+                args.max_val_steps,
+                rank,
+                world_size,
+            )
+            print_rank0(
+                " ".join(
+                    part for part in (
+                        f"epoch={epoch}",
+                        f"train_loss={train_loss:.6f}",
+                        format_metrics(train_metrics, "train"),
+                        f"val_loss={val_loss:.6f}",
+                        format_metrics(val_metrics, "val"),
+                    )
+                    if part
+                ),
+                rank,
+            )
+            if is_main_process(rank):
+                epoch_metadata = {
+                    **metadata,
+                    "epoch": epoch,
+                    "train_loss": train_loss,
+                    "val_loss": val_loss,
+                    "train_metrics": train_metrics,
+                    "val_metrics": val_metrics,
+                }
+                save_checkpoint(
+                    output_dir / "last_heads.pt",
+                    heads_model,
+                    epoch_metadata,
+                )
+                if val_loss < best_val:
+                    best_val = val_loss
+                    save_checkpoint(
+                        output_dir / "best_heads.pt",
+                        heads_model,
+                        epoch_metadata,
+                    )
+    finally:
+        cleanup_torchrun()
 
 
 if __name__ == "__main__":

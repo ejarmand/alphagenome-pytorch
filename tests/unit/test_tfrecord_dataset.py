@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 import numpy as np
+import pytest
 import torch
 
 from alphagenome_pytorch.extensions.finetuning.tfrecord_dataset import (
@@ -14,7 +15,12 @@ from alphagenome_pytorch.extensions.finetuning.tfrecord_dataset import (
     collate_tfr_multimodal,
 )
 from alphagenome_pytorch.extensions.finetuning.heads import create_finetuning_head
-from scripts.finetune_tfr_heads import compute_loss
+from scripts.finetune_tfr_heads import (
+    compute_loss,
+    compute_regression_metrics,
+    new_metric_stats,
+    update_metric_stats,
+)
 
 
 def _write_minimal_dataset(tmp_path):
@@ -72,6 +78,25 @@ def test_multimodal_metadata_and_modality_selection(tmp_path):
     assert dataset.target_indices_by_modality["ATAC"].tolist() == [0, 2]
     assert dataset.target_indices_by_modality["RNA"].tolist() == [1]
     assert BaskervilleTFRecordDataset.available_modalities(data_dir) == ["ATAC", "RNA"]
+
+
+def test_worker_files_shards_by_rank(tmp_path):
+    data_dir = _write_minimal_dataset(tmp_path)
+    for i in range(4):
+        (data_dir / "tfrecords" / f"train-{i}.tfr").write_bytes(b"")
+
+    rank0 = BaskervilleTFRecordDataset(data_dir, modality="ATAC", rank=0, world_size=2)
+    rank1 = BaskervilleTFRecordDataset(data_dir, modality="ATAC", rank=1, world_size=2)
+
+    assert [path.name for path in rank0._worker_files()] == [
+        "train-0.tfr",
+        "train-2.tfr",
+        "train-10.tfr",
+    ]
+    assert [path.name for path in rank1._worker_files()] == [
+        "train-1.tfr",
+        "train-3.tfr",
+    ]
 
 
 def test_modality_selection_uses_row_positions_for_filtered_targets(tmp_path):
@@ -189,3 +214,15 @@ def test_poisson_multinomial_loss_alias_runs():
     )
 
     assert torch.isfinite(loss)
+
+
+def test_regression_metric_stats_accumulate_pearson_and_r2():
+    pred = torch.tensor([[[1.0], [2.0]], [[3.0], [4.0]]])
+    target = pred.clone()
+    stats = new_metric_stats(torch.device("cpu"))
+
+    update_metric_stats(stats, pred, target)
+    metrics = compute_regression_metrics(stats)
+
+    assert metrics["pearson_r"] == pytest.approx(1.0)
+    assert metrics["r2"] == pytest.approx(1.0)
