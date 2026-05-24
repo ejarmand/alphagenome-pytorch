@@ -319,12 +319,10 @@ class BaskervilleTFRecordDataset(IterableDataset):
         if dist.is_available() and dist.is_initialized():
             rank = dist.get_rank()
             world_size = dist.get_world_size()
-        if worker is not None:
-            global_worker_id = rank * worker.num_workers + worker.id
-            global_num_workers = world_size * worker.num_workers
-            files = files[global_worker_id::global_num_workers]
-        elif world_size > 1:
+        if world_size > 1:
             files = files[rank::world_size]
+        if worker is not None:
+            files = files[worker.id::worker.num_workers]
         if self.shuffle_files:
             worker_id = worker.id if worker is not None else 0
             shuffle_seed = self.seed + rank * 1009 + worker_id

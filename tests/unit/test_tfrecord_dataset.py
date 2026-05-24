@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 
+import alphagenome_pytorch.extensions.finetuning.tfrecord_dataset as tfr_module
 from alphagenome_pytorch.extensions.finetuning.tfrecord_dataset import (
     BaskervilleMultiTFRecordDataset,
     BaskervilleTFRecordDataset,
@@ -97,6 +99,35 @@ def test_worker_files_shards_by_rank(tmp_path):
         "train-1.tfr",
         "train-3.tfr",
     ]
+
+
+def test_worker_files_shards_by_rank_before_worker(tmp_path, monkeypatch):
+    data_dir = _write_minimal_dataset(tmp_path)
+    for path in (data_dir / "tfrecords").glob("train-*.tfr"):
+        path.unlink()
+    for i in range(16):
+        (data_dir / "tfrecords" / f"train-{i}.tfr").write_bytes(b"")
+
+    for rank in range(8):
+        dataset = BaskervilleTFRecordDataset(
+            data_dir,
+            modality="ATAC",
+            rank=rank,
+            world_size=8,
+        )
+        rank_files = []
+        for worker_id in range(8):
+            monkeypatch.setattr(
+                tfr_module,
+                "get_worker_info",
+                lambda worker_id=worker_id: SimpleNamespace(
+                    id=worker_id,
+                    num_workers=8,
+                ),
+            )
+            rank_files.extend(path.name for path in dataset._worker_files())
+
+        assert set(rank_files) == {f"train-{rank}.tfr", f"train-{rank + 8}.tfr"}
 
 
 def test_modality_selection_uses_row_positions_for_filtered_targets(tmp_path):
