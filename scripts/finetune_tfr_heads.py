@@ -53,6 +53,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument(
+        "--val-num-workers",
+        type=int,
+        default=0,
+        help=(
+            "Validation DataLoader workers per rank. Defaults to 0 to avoid "
+            "forking TFRecord workers after CUDA/DDP initialization."
+        ),
+    )
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument(
@@ -91,6 +100,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--track-means-samples", type=int, default=16)
     parser.add_argument("--max-train-steps", type=int)
     parser.add_argument("--max-val-steps", type=int)
+    parser.add_argument(
+        "--tfr-num-parallel-reads",
+        type=int,
+        default=1,
+        help=(
+            "Number of parallel TFRecord reads per DataLoader worker. Defaults "
+            "to 1 to avoid TensorFlow thread oversubscription under torchrun."
+        ),
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("finetuning_output/tfr_heads"))
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--device", default="auto", help="'auto', 'cpu', 'cuda', or e.g. 'cuda:0'")
@@ -101,6 +119,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-entity", default=None)
     parser.add_argument("--wandb-run-name", default=None)
     parser.add_argument("--wandb-tags", default=None, help="Comma-separated W&B tags.")
+    parser.add_argument(
+        "--debug-ranks",
+        action="store_true",
+        help="Print per-rank progress around DataLoader and distributed synchronization.",
+    )
     parser.add_argument("--loader-only", action="store_true", help="Decode one batch and exit.")
     return parser.parse_args()
 
@@ -113,6 +136,7 @@ def create_tfr_dataset(
     *,
     repeat: bool = False,
     shuffle_files: bool = False,
+    num_parallel_reads: int | None = 1,
     rank: int = 0,
     world_size: int = 1,
 ) -> BaskervilleMultiTFRecordDataset:
@@ -123,6 +147,7 @@ def create_tfr_dataset(
         pooling=pooling,  # type: ignore[arg-type]
         repeat=repeat,
         shuffle_files=shuffle_files,
+        num_parallel_reads=num_parallel_reads,
         rank=rank,
         world_size=world_size,
     )
@@ -132,15 +157,19 @@ def create_loader(
     dataset: BaskervilleMultiTFRecordDataset,
     batch_size: int,
     num_workers: int,
+    *,
+    persistent_workers: bool = False,
 ) -> DataLoader:
+    local_files = dataset._worker_files()
+    effective_workers = min(num_workers, len(local_files)) if num_workers > 0 else 0
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        num_workers=num_workers,
+        num_workers=effective_workers,
         collate_fn=collate_tfr_multimodal,
         pin_memory=torch.cuda.is_available(),
-        prefetch_factor=2 if num_workers > 0 else None,
-        persistent_workers=num_workers > 0,
+        prefetch_factor=1 if effective_workers > 0 else None,
+        persistent_workers=persistent_workers and effective_workers > 0,
     )
 
 
@@ -510,6 +539,8 @@ def run_epoch(
     data_iter = iter(loader)
 
     while max_steps is None or steps < max_steps:
+        if args.debug_ranks and steps < 3:
+            print(f"[rank{rank}] {pbar.desc} step={steps} next_batch start", flush=True)
         try:
             sequences, modality_targets = next(data_iter)
             has_batch = torch.tensor(1, device=device)
@@ -517,9 +548,23 @@ def run_epoch(
             sequences = None
             modality_targets = None
             has_batch = torch.tensor(0, device=device)
+        if args.debug_ranks and steps < 3:
+            print(
+                f"[rank{rank}] {pbar.desc} step={steps} "
+                f"next_batch done has_batch={int(has_batch.item())}",
+                flush=True,
+            )
 
         if world_size > 1:
+            if args.debug_ranks and steps < 3:
+                print(f"[rank{rank}] {pbar.desc} step={steps} all_reduce start", flush=True)
             dist.all_reduce(has_batch, op=dist.ReduceOp.MIN)
+            if args.debug_ranks and steps < 3:
+                print(
+                    f"[rank{rank}] {pbar.desc} step={steps} "
+                    f"all_reduce done has_batch={int(has_batch.item())}",
+                    flush=True,
+                )
         if has_batch.item() == 0:
             break
         if sequences is None or modality_targets is None:
@@ -708,6 +753,7 @@ def main() -> None:
             args.pooling,
             repeat=False,
             shuffle_files=True,
+            num_parallel_reads=args.tfr_num_parallel_reads,
             rank=rank,
             world_size=world_size,
         )
@@ -716,12 +762,35 @@ def main() -> None:
             "valid",
             modalities,
             args.pooling,
+            num_parallel_reads=args.tfr_num_parallel_reads,
             rank=rank,
             world_size=world_size,
         )
 
-        train_loader = create_loader(train_dataset, args.batch_size, args.num_workers)
-        val_loader = create_loader(val_dataset, args.batch_size, args.num_workers)
+        train_loader = create_loader(
+            train_dataset,
+            args.batch_size,
+            args.num_workers,
+            persistent_workers=True,
+        )
+        val_loader = create_loader(
+            val_dataset,
+            args.batch_size,
+            args.val_num_workers,
+            persistent_workers=False,
+        )
+        print_rank0(
+            " ".join(
+                (
+                    f"TFRecord files/rank: train={len(train_dataset._worker_files())}",
+                    f"valid={len(val_dataset._worker_files())}",
+                    f"DataLoader workers: train={train_loader.num_workers}",
+                    f"valid={val_loader.num_workers}",
+                    f"tf_parallel_reads={args.tfr_num_parallel_reads}",
+                )
+            ),
+            rank,
+        )
 
         sample_sequences, sample_targets = next(iter(train_loader))
         print_rank0(
@@ -857,6 +926,7 @@ def main() -> None:
             "world_size": world_size,
             "batch_size": args.batch_size,
             "num_workers": args.num_workers,
+            "val_num_workers": args.val_num_workers,
             "epochs": args.epochs,
             "lr": args.lr,
             "lr_schedule": args.lr_schedule,
