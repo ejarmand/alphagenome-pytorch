@@ -18,12 +18,17 @@ from alphagenome_pytorch.extensions.finetuning.tfrecord_dataset import (
 )
 from alphagenome_pytorch.extensions.finetuning.heads import create_finetuning_head
 from alphagenome_pytorch.heads import GenomeTracksHead
+from alphagenome_pytorch.utils.sequence import (
+    reverse_complement_onehot,
+    shift_onehot,
+)
 from scripts.finetune_tfr_heads import (
     TFRHeads,
     compute_loss,
     compute_regression_metrics,
     cell_types_from_target_rows,
     new_metric_stats,
+    switch_reverse_predictions,
     update_metric_stats,
 )
 
@@ -82,6 +87,8 @@ def test_multimodal_metadata_and_modality_selection(tmp_path):
     assert dataset.assay_type_by_modality == {"ATAC": "atac", "RNA": "rna_seq"}
     assert dataset.target_indices_by_modality["ATAC"].tolist() == [0, 2]
     assert dataset.target_indices_by_modality["RNA"].tolist() == [1]
+    assert dataset.strand_pair_by_modality["ATAC"].tolist() == [0, 1]
+    assert dataset.strand_pair_by_modality["RNA"].tolist() == [0]
     assert BaskervilleTFRecordDataset.available_modalities(data_dir) == ["ATAC", "RNA"]
 
 
@@ -97,6 +104,20 @@ def test_cell_types_from_target_rows_uses_ct_with_identifier_fallback():
     assert cell_types_from_target_rows(rows) == {
         "ATAC": ["cell_a", "track1"],
         "RNA": ["track2"],
+    }
+
+
+def test_cell_types_from_target_rows_keeps_stranded_tracks_distinct():
+    rows = {
+        "RNA": [
+            {"index": "0", "identifier": "cell+", "ct": "cell", "strand_pair": "1"},
+            {"index": "1", "identifier": "cell-", "ct": "cell", "strand_pair": "0"},
+            {"index": "2", "identifier": "bulk", "ct": "bulk", "strand_pair": "2"},
+        ],
+    }
+
+    assert cell_types_from_target_rows(rows) == {
+        "RNA": ["cell|strand=+", "cell|strand=-", "bulk"],
     }
 
 
@@ -241,6 +262,65 @@ def test_decode_sequence_accepts_indices_and_onehot():
     onehot = np.eye(4, dtype=np.uint8)[[0, 1, 2, 3]]
     decoded_onehot = BaskervilleTFRecordDataset._decode_sequence(onehot.tobytes(), 4)
     np.testing.assert_array_equal(decoded_onehot, onehot.astype(np.float32))
+
+
+def test_reverse_complement_sequence_matches_baskerville_order():
+    sequence = np.eye(4, dtype=np.float32)
+
+    rc = BaskervilleTFRecordDataset._reverse_complement_sequence(sequence)
+
+    np.testing.assert_array_equal(rc, reverse_complement_onehot(sequence))
+    np.testing.assert_array_equal(rc, np.eye(4, dtype=np.float32))
+
+
+def test_shift_sequence_matches_baskerville_padding():
+    sequence = np.arange(20, dtype=np.float32).reshape(5, 4)
+
+    shifted_right = BaskervilleTFRecordDataset._shift_sequence(sequence, 2)
+    shifted_left = BaskervilleTFRecordDataset._shift_sequence(sequence, -2)
+
+    np.testing.assert_array_equal(shifted_right, shift_onehot(sequence, 2))
+    np.testing.assert_array_equal(shifted_left, shift_onehot(sequence, -2))
+    np.testing.assert_array_equal(shifted_right[:2], np.zeros((2, 4), dtype=np.float32))
+    np.testing.assert_array_equal(shifted_right[2:], sequence[:-2])
+    np.testing.assert_array_equal(shifted_left[-2:], np.zeros((2, 4), dtype=np.float32))
+    np.testing.assert_array_equal(shifted_left[:-2], sequence[2:])
+
+
+def test_strand_pair_uses_baskerville_column(tmp_path):
+    data_dir = _write_minimal_dataset(tmp_path)
+    (data_dir / "targets.txt").write_text(
+        "\t".join(["index", "identifier", "modality", "strand_pair"]) + "\n"
+        "0\tcell+\tRNA\t1\n"
+        "1\tcell-\tRNA\t0\n"
+        "2\tatac\tATAC\t2\n"
+    )
+
+    dataset = BaskervilleMultiTFRecordDataset(data_dir, modalities=["RNA", "ATAC"])
+
+    assert dataset.strand_pair_by_modality["RNA"].tolist() == [1, 0]
+    assert dataset.strand_pair_by_modality["ATAC"].tolist() == [0]
+
+
+def test_switch_reverse_predictions_flips_length_and_strand_pairs():
+    pred = torch.tensor(
+        [
+            [[1.0, 10.0], [2.0, 20.0], [3.0, 30.0]],
+            [[4.0, 40.0], [5.0, 50.0], [6.0, 60.0]],
+        ]
+    )
+    reverse = torch.tensor([True, False])
+    strand_pair = torch.tensor([1, 0])
+
+    switched = switch_reverse_predictions(pred, reverse, strand_pair)
+
+    expected = torch.tensor(
+        [
+            [[30.0, 3.0], [20.0, 2.0], [10.0, 1.0]],
+            [[4.0, 40.0], [5.0, 50.0], [6.0, 60.0]],
+        ]
+    )
+    torch.testing.assert_close(switched, expected)
 
 
 def test_decode_and_pool_targets(tmp_path):

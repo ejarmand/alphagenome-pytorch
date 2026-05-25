@@ -20,6 +20,11 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import IterableDataset, get_worker_info
 
+from alphagenome_pytorch.utils.sequence import (
+    reverse_complement_onehot,
+    shift_onehot,
+)
+
 _Pooling = Literal["mean", "sum"]
 _Split = Literal["train", "valid", "test"]
 
@@ -89,7 +94,10 @@ def collate_tfr_genomic(
 
 def collate_tfr_multimodal(
     batch: list[tuple[torch.Tensor, dict[str, dict[int, torch.Tensor]]]],
-) -> tuple[torch.Tensor, dict[str, dict[int, torch.Tensor]]]:
+) -> (
+    tuple[torch.Tensor, dict[str, dict[int, torch.Tensor]]]
+    | tuple[torch.Tensor, dict[str, dict[int, torch.Tensor]], dict[str, torch.Tensor]]
+):
     """Collate samples yielded by :class:`BaskervilleMultiTFRecordDataset`."""
     sequences = torch.stack([item[0] for item in batch], dim=0)
     first_targets = batch[0][1]
@@ -99,6 +107,18 @@ def collate_tfr_multimodal(
         }
         for modality in first_targets
     }
+    if len(batch[0]) == 3:
+        augmentation = {
+            "reverse_complement": torch.tensor(
+                [bool(item[2]["reverse_complement"]) for item in batch],
+                dtype=torch.bool,
+            ),
+            "shift": torch.tensor(
+                [int(item[2]["shift"]) for item in batch],
+                dtype=torch.long,
+            ),
+        }
+        return sequences, targets, augmentation
     return sequences, targets
 
 
@@ -124,10 +144,14 @@ class BaskervilleTFRecordDataset(IterableDataset):
         num_parallel_reads: int | None = None,
         rank: int = 0,
         world_size: int = 1,
+        augment_rc: bool = False,
+        augment_shift: int = 0,
     ):
         super().__init__()
         if pooling not in ("mean", "sum"):
             raise ValueError(f"pooling must be 'mean' or 'sum', got {pooling!r}")
+        if augment_shift < 0:
+            raise ValueError(f"augment_shift must be >= 0, got {augment_shift}")
         if rank < 0:
             raise ValueError(f"rank must be >= 0, got {rank}")
         if world_size < 1:
@@ -145,6 +169,8 @@ class BaskervilleTFRecordDataset(IterableDataset):
         self.num_parallel_reads = num_parallel_reads
         self.rank = rank
         self.world_size = world_size
+        self.augment_rc = augment_rc
+        self.augment_shift = augment_shift
 
         self.metadata = self._load_metadata(self.data_dir)
         self.files = self._get_tfrecord_files(self.data_dir, split)
@@ -152,6 +178,7 @@ class BaskervilleTFRecordDataset(IterableDataset):
         self.target_indices = np.asarray(indices, dtype=np.int64)
         self.target_rows = target_rows
         self.n_tracks = len(indices)
+        self.strand_pair = self._strand_pair_for_indices(indices, target_rows)
 
     def __len__(self) -> int:
         if self.split not in self.metadata.split_counts:
@@ -311,6 +338,54 @@ class BaskervilleTFRecordDataset(IterableDataset):
             return reshaped.sum(axis=1)
         raise ValueError(f"Unknown pooling={self.pooling!r}; expected 'mean' or 'sum'.")
 
+    @staticmethod
+    def _reverse_complement_sequence(sequence: np.ndarray) -> np.ndarray:
+        return reverse_complement_onehot(sequence)
+
+    @staticmethod
+    def _shift_sequence(sequence: np.ndarray, shift: int) -> np.ndarray:
+        return shift_onehot(sequence, shift)
+
+    def _augmentation_rng(self) -> random.Random:
+        worker = get_worker_info()
+        worker_id = worker.id if worker is not None else 0
+        rank = self.rank
+        if dist.is_available() and dist.is_initialized():
+            rank = dist.get_rank()
+        return random.Random(self.seed + rank * 1009 + worker_id * 9176)
+
+    def _augment_sequence(
+        self,
+        sequence: np.ndarray,
+        rng: random.Random,
+    ) -> tuple[np.ndarray, dict[str, int | bool]]:
+        reverse_complement = self.augment_rc and rng.random() > 0.5
+        shift = (
+            rng.randint(-self.augment_shift, self.augment_shift)
+            if self.augment_shift > 0
+            else 0
+        )
+        if reverse_complement:
+            sequence = self._reverse_complement_sequence(sequence)
+        if shift != 0:
+            sequence = self._shift_sequence(sequence, shift)
+        return sequence, {"reverse_complement": reverse_complement, "shift": shift}
+
+    @staticmethod
+    def _strand_pair_for_indices(
+        indices: list[int],
+        rows: list[dict[str, str]],
+    ) -> np.ndarray:
+        index_to_local = {int(index): local for local, index in enumerate(indices)}
+        pairs = []
+        for local_idx, row in enumerate(rows):
+            try:
+                pair_index = int(row.get("strand_pair", indices[local_idx]))
+            except (TypeError, ValueError):
+                pair_index = indices[local_idx]
+            pairs.append(index_to_local.get(pair_index, local_idx))
+        return np.asarray(pairs, dtype=np.int64)
+
     def _worker_files(self) -> list[Path]:
         files = list(self.files)
         worker = get_worker_info()
@@ -372,6 +447,7 @@ class BaskervilleTFRecordDataset(IterableDataset):
         files = self._worker_files()
         if not files:
             return
+        rng = self._augmentation_rng()
 
         while True:
             dataset = self._tf_dataset(files)
@@ -390,13 +466,21 @@ class BaskervilleTFRecordDataset(IterableDataset):
                     parsed["sequence"].numpy(),
                     self.metadata.seq_length,
                 )
+                sequence, augmentation = self._augment_sequence(sequence, rng)
                 target = self._decode_target(parsed["target"].numpy())
                 target_128bp = self._pool_target_128bp(target)
 
-                yield (
-                    torch.from_numpy(sequence).float(),
-                    {128: torch.from_numpy(target_128bp).float()},
-                )
+                if self.augment_rc or self.augment_shift:
+                    yield (
+                        torch.from_numpy(sequence).float(),
+                        {128: torch.from_numpy(target_128bp).float()},
+                        augmentation,
+                    )
+                else:
+                    yield (
+                        torch.from_numpy(sequence).float(),
+                        {128: torch.from_numpy(target_128bp).float()},
+                    )
 
             if not self.repeat:
                 break
@@ -418,6 +502,8 @@ class BaskervilleMultiTFRecordDataset(BaskervilleTFRecordDataset):
         num_parallel_reads: int | None = None,
         rank: int = 0,
         world_size: int = 1,
+        augment_rc: bool = False,
+        augment_shift: int = 0,
     ):
         if modalities is None:
             modalities = self.available_modalities(data_dir)
@@ -436,15 +522,22 @@ class BaskervilleMultiTFRecordDataset(BaskervilleTFRecordDataset):
             num_parallel_reads=num_parallel_reads,
             rank=rank,
             world_size=world_size,
+            augment_rc=augment_rc,
+            augment_shift=augment_shift,
         )
 
         self.target_indices_by_modality: dict[str, np.ndarray] = {}
         self.target_rows_by_modality: dict[str, list[dict[str, str]]] = {}
+        self.strand_pair_by_modality: dict[str, np.ndarray] = {}
         self.assay_type_by_modality: dict[str, str] = {}
         for modality in self.modalities:
             indices, rows = self._modality_indices(self.data_dir, modality)
             self.target_indices_by_modality[modality] = np.asarray(indices, dtype=np.int64)
             self.target_rows_by_modality[modality] = rows
+            self.strand_pair_by_modality[modality] = self._strand_pair_for_indices(
+                indices,
+                rows,
+            )
             key = modality.upper()
             if key not in _MODALITY_TO_ASSAY_TYPE:
                 available = ", ".join(sorted(_MODALITY_TO_ASSAY_TYPE))
@@ -458,6 +551,7 @@ class BaskervilleMultiTFRecordDataset(BaskervilleTFRecordDataset):
         files = self._worker_files()
         if not files:
             return
+        rng = self._augmentation_rng()
 
         while True:
             dataset = self._tf_dataset(files)
@@ -476,6 +570,7 @@ class BaskervilleMultiTFRecordDataset(BaskervilleTFRecordDataset):
                     parsed["sequence"].numpy(),
                     self.metadata.seq_length,
                 )
+                sequence, augmentation = self._augment_sequence(sequence, rng)
                 full_target = self._decode_full_target(parsed["target"].numpy())
                 modality_targets = {}
                 for modality, indices in self.target_indices_by_modality.items():
@@ -485,7 +580,10 @@ class BaskervilleMultiTFRecordDataset(BaskervilleTFRecordDataset):
                         128: torch.from_numpy(target_128bp).float()
                     }
 
-                yield torch.from_numpy(sequence).float(), modality_targets
+                if self.augment_rc or self.augment_shift:
+                    yield torch.from_numpy(sequence).float(), modality_targets, augmentation
+                else:
+                    yield torch.from_numpy(sequence).float(), modality_targets
 
             if not self.repeat:
                 break

@@ -128,6 +128,23 @@ def parse_args() -> argparse.Namespace:
             "to 1 to avoid TensorFlow thread oversubscription under torchrun."
         ),
     )
+    parser.add_argument(
+        "--augment-rc",
+        action="store_true",
+        help=(
+            "Apply Baskerville-style stochastic reverse-complement augmentation "
+            "during training and switch predictions back with strand_pair."
+        ),
+    )
+    parser.add_argument(
+        "--augment-shift",
+        type=int,
+        default=0,
+        help=(
+            "Apply Baskerville-style stochastic sequence shifts in [-N, N] bp "
+            "during training. Targets are left unchanged."
+        ),
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("finetuning_output/tfr_heads"))
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--device", default="auto", help="'auto', 'cpu', 'cuda', or e.g. 'cuda:0'")
@@ -158,6 +175,8 @@ def create_tfr_dataset(
     num_parallel_reads: int | None = 1,
     rank: int = 0,
     world_size: int = 1,
+    augment_rc: bool = False,
+    augment_shift: int = 0,
 ) -> BaskervilleMultiTFRecordDataset:
     return BaskervilleMultiTFRecordDataset(
         data_dir,
@@ -169,6 +188,8 @@ def create_tfr_dataset(
         num_parallel_reads=num_parallel_reads,
         rank=rank,
         world_size=world_size,
+        augment_rc=augment_rc,
+        augment_shift=augment_shift,
     )
 
 
@@ -251,10 +272,23 @@ def cell_types_from_target_rows(
 ) -> dict[str, list[str]]:
     cell_types_by_modality = {}
     for modality, rows in target_rows_by_modality.items():
-        cell_types_by_modality[modality] = [
-            row.get("ct") or row.get("identifier") or f"{modality}_{idx}"
-            for idx, row in enumerate(rows)
-        ]
+        cell_types = []
+        for idx, row in enumerate(rows):
+            cell_type = row.get("ct") or row.get("identifier") or f"{modality}_{idx}"
+            strand = row.get("strand") if row.get("strand") in ("+", "-") else ""
+            if not strand:
+                try:
+                    row_index = int(row.get("index", idx))
+                    strand_pair = int(row.get("strand_pair", row_index))
+                except (TypeError, ValueError):
+                    row_index = strand_pair = idx
+                identifier = row.get("identifier", "")
+                if strand_pair != row_index and identifier.endswith(("+", "-")):
+                    strand = identifier[-1]
+            if strand in ("+", "-"):
+                cell_type = f"{cell_type}|strand={strand}"
+            cell_types.append(cell_type)
+        cell_types_by_modality[modality] = cell_types
     return cell_types_by_modality
 
 
@@ -581,6 +615,39 @@ def crop_predictions(pred: torch.Tensor, crop_bins: int) -> torch.Tensor:
     return pred[:, crop_bins:-crop_bins, :]
 
 
+def unpack_tfr_batch(
+    batch: tuple[torch.Tensor, dict[str, dict[int, torch.Tensor]]]
+    | tuple[torch.Tensor, dict[str, dict[int, torch.Tensor]], dict[str, torch.Tensor]],
+) -> tuple[
+    torch.Tensor,
+    dict[str, dict[int, torch.Tensor]],
+    dict[str, torch.Tensor] | None,
+]:
+    if len(batch) == 3:
+        sequences, modality_targets, augmentation = batch
+        return sequences, modality_targets, augmentation
+    sequences, modality_targets = batch
+    return sequences, modality_targets, None
+
+
+def switch_reverse_predictions(
+    pred: torch.Tensor,
+    reverse_complement: torch.Tensor | None,
+    strand_pair: torch.Tensor | None,
+) -> torch.Tensor:
+    """Match Baskerville SwitchReverse for channels-last 1D predictions."""
+    if reverse_complement is None or not bool(reverse_complement.any()):
+        return pred
+    reversed_pred = torch.flip(pred, dims=[1])
+    if strand_pair is not None:
+        reversed_pred = reversed_pred.index_select(-1, strand_pair.to(pred.device))
+    return torch.where(
+        reverse_complement.to(pred.device).view(-1, 1, 1),
+        reversed_pred,
+        pred,
+    )
+
+
 def autocast_context(device: torch.device, use_amp: bool):
     if not use_amp or device.type != "cuda":
         return nullcontext()
@@ -703,6 +770,8 @@ def forward_heads(
     use_amp: bool,
     return_scaled: bool,
     requires_grad: bool,
+    reverse_complement: torch.Tensor | None = None,
+    strand_pair_by_modality: dict[str, torch.Tensor] | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     amp_context = autocast_context(sequences.device, use_amp)
     with torch.no_grad():
@@ -735,13 +804,30 @@ def forward_heads(
                     return_scaled=False,
                 )
 
+    switched_loss_predictions = {}
+    switched_metric_predictions = {}
+    for modality, prediction in loss_predictions.items():
+        strand_pair = None
+        if strand_pair_by_modality is not None:
+            strand_pair = strand_pair_by_modality.get(modality)
+        switched_loss_predictions[modality] = switch_reverse_predictions(
+            prediction,
+            reverse_complement,
+            strand_pair,
+        )
+        switched_metric_predictions[modality] = switch_reverse_predictions(
+            metric_predictions[modality],
+            reverse_complement,
+            strand_pair,
+        )
+
     cropped_loss_predictions = {
         modality: crop_predictions(prediction, crop_bins)
-        for modality, prediction in loss_predictions.items()
+        for modality, prediction in switched_loss_predictions.items()
     }
     cropped_metric_predictions = {
         modality: crop_predictions(prediction, crop_bins)
-        for modality, prediction in metric_predictions.items()
+        for modality, prediction in switched_metric_predictions.items()
     }
     return cropped_loss_predictions, cropped_metric_predictions
 
@@ -770,6 +856,10 @@ def run_epoch(
     grad_norm_count = torch.tensor(0.0, device=device)
     grad_norm_max = torch.tensor(0.0, device=device)
     metric_stats: dict[str, torch.Tensor] = {}
+    strand_pair_by_modality = {
+        modality: torch.as_tensor(indices, dtype=torch.long, device=device)
+        for modality, indices in loader.dataset.strand_pair_by_modality.items()
+    }
     steps = 0
     accumulated_steps = 0
     pbar = tqdm(
@@ -784,11 +874,13 @@ def run_epoch(
         if args.debug_ranks and steps < 3:
             print(f"[rank{rank}] {pbar.desc} step={steps} next_batch start", flush=True)
         try:
-            sequences, modality_targets = next(data_iter)
+            batch = next(data_iter)
+            sequences, modality_targets, augmentation = unpack_tfr_batch(batch)
             has_batch = torch.tensor(1, device=device)
         except StopIteration:
             sequences = None
             modality_targets = None
+            augmentation = None
             has_batch = torch.tensor(0, device=device)
         if args.debug_ranks and steps < 3:
             print(
@@ -814,6 +906,12 @@ def run_epoch(
 
         sequences = sequences.to(device, non_blocking=True)
         organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
+        reverse_complement = None
+        if augmentation is not None:
+            reverse_complement = augmentation["reverse_complement"].to(
+                device,
+                non_blocking=True,
+            )
 
         predictions_by_modality, metric_predictions_by_modality = forward_heads(
             model,
@@ -824,6 +922,8 @@ def run_epoch(
             use_amp=not args.no_amp,
             return_scaled=args.loss in ("poisson-multinomial", "multinomial"),
             requires_grad=training,
+            reverse_complement=reverse_complement,
+            strand_pair_by_modality=strand_pair_by_modality,
         )
         loss = torch.tensor(0.0, device=device)
         loss_by_modality = {}
@@ -1023,6 +1123,8 @@ def main() -> None:
             num_parallel_reads=args.tfr_num_parallel_reads,
             rank=rank,
             world_size=world_size,
+            augment_rc=args.augment_rc,
+            augment_shift=args.augment_shift,
         )
         val_dataset = create_tfr_dataset(
             args.data_dir,
@@ -1062,7 +1164,9 @@ def main() -> None:
             rank,
         )
 
-        sample_sequences, sample_targets = next(iter(train_loader))
+        sample_sequences, sample_targets, sample_augmentation = unpack_tfr_batch(
+            next(iter(train_loader))
+        )
         print_rank0(
             "Loader OK: "
             f"seq={tuple(sample_sequences.shape)} "
@@ -1075,6 +1179,15 @@ def main() -> None:
             + f" modalities={modalities}",
             rank,
         )
+        if sample_augmentation is not None:
+            print_rank0(
+                "Augmentation: "
+                f"rc={args.augment_rc} "
+                f"shift={args.augment_shift} "
+                f"sample_rc={sample_augmentation['reverse_complement'].tolist()} "
+                f"sample_shift={sample_augmentation['shift'].tolist()}",
+                rank,
+            )
         if args.loader_only:
             return
 
@@ -1204,6 +1317,10 @@ def main() -> None:
                 ]
                 for modality in modalities
             },
+            "strand_pair": {
+                modality: train_dataset.strand_pair_by_modality[modality].tolist()
+                for modality in modalities
+            },
             "cell_types": cell_types_by_modality,
             "n_cell_types": len(unwrap_heads(heads_model).cell_layers),
             "cell_embedding_dim": args.cell_embedding_dim,
@@ -1228,6 +1345,8 @@ def main() -> None:
             "weight_decay": args.weight_decay,
             "dtype": args.dtype,
             "use_amp": not args.no_amp,
+            "augment_rc": args.augment_rc,
+            "augment_shift": args.augment_shift,
         }
         if is_main_process(rank):
             (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
