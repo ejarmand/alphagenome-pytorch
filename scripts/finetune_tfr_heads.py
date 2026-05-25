@@ -7,6 +7,7 @@ import argparse
 import json
 import math
 import os
+import re
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
@@ -30,6 +31,7 @@ from alphagenome_pytorch.extensions.finetuning.tfrecord_dataset import (
 )
 from alphagenome_pytorch.extensions.finetuning.training import create_lr_scheduler
 from alphagenome_pytorch.extensions.finetuning.transfer import load_trunk, remove_all_heads
+from alphagenome_pytorch.heads import EMBEDDING_128BP_DIM
 from alphagenome_pytorch.losses import multinomial_loss
 
 
@@ -98,6 +100,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--positional-weight", type=float, default=5.0)
     parser.add_argument("--count-weight", type=float, default=1.0)
     parser.add_argument("--track-means-samples", type=int, default=16)
+    parser.add_argument(
+        "--cell-embedding-dim",
+        type=int,
+        default=16,
+        help=(
+            "Bottleneck dimension for shared cell-type embeddings before the "
+            "per-modality 1-output layer."
+        ),
+    )
     parser.add_argument("--max-train-steps", type=int)
     parser.add_argument("--max-val-steps", type=int)
     parser.add_argument(
@@ -201,12 +212,200 @@ def resolve_warmup_steps(warmup_steps: int | None, total_steps: int) -> int:
     return max(1, math.ceil(total_steps * 0.01))
 
 
-class TFRHeads(nn.Module):
-    """Small DDP-friendly wrapper around one 128 bp head per modality."""
+def _module_key(name: str, used: set[str]) -> str:
+    key = re.sub(r"[^A-Za-z0-9_]", "_", name).strip("_") or "cell"
+    if key[0].isdigit():
+        key = f"cell_{key}"
+    base = key
+    suffix = 1
+    while key in used:
+        suffix += 1
+        key = f"{base}_{suffix}"
+    used.add(key)
+    return key
 
-    def __init__(self, heads: dict[str, nn.Module]):
+
+def create_cell_type_key_map(cell_types_by_modality: dict[str, list[str]]) -> dict[str, str]:
+    used: set[str] = set()
+    key_by_cell_type = {}
+    for cell_types in cell_types_by_modality.values():
+        for cell_type in cell_types:
+            if cell_type not in key_by_cell_type:
+                key_by_cell_type[cell_type] = _module_key(cell_type, used)
+    return key_by_cell_type
+
+
+def cell_types_from_target_rows(
+    target_rows_by_modality: dict[str, list[dict[str, str]]],
+) -> dict[str, list[str]]:
+    cell_types_by_modality = {}
+    for modality, rows in target_rows_by_modality.items():
+        cell_types_by_modality[modality] = [
+            row.get("ct") or row.get("identifier") or f"{modality}_{idx}"
+            for idx, row in enumerate(rows)
+        ]
+    return cell_types_by_modality
+
+
+class CellTypeTrackGroups(nn.Module):
+    """Track-index buffers for one modality, grouped by shared cell type."""
+
+    def __init__(self, cell_keys: list[str]):
         super().__init__()
+        self.cell_keys = []
+        cell_index_by_key = {}
+        for cell_key in dict.fromkeys(cell_keys):
+            indices = [
+                track_idx
+                for track_idx, track_cell_key in enumerate(cell_keys)
+                if track_cell_key == cell_key
+            ]
+            cell_index_by_key[cell_key] = len(self.cell_keys)
+            self.cell_keys.append(cell_key)
+            self.register_buffer(
+                cell_key,
+                torch.tensor(indices, dtype=torch.long),
+                persistent=False,
+            )
+        self.register_buffer(
+            "track_cell_indices",
+            torch.tensor(
+                [cell_index_by_key[cell_key] for cell_key in cell_keys],
+                dtype=torch.long,
+            ),
+            persistent=False,
+        )
+
+
+class CellTypeEmbedding(nn.Module):
+    """Per-cell bottleneck projection from trunk embeddings to cell embeddings."""
+
+    def __init__(self, input_dim: int, output_dim: int):
+        super().__init__()
+        self.proj = nn.Conv1d(input_dim, output_dim, kernel_size=1)
+        stdv = 1.0 / math.sqrt(input_dim)
+        nn.init.trunc_normal_(self.proj.weight, std=stdv)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj(x)
+
+
+class TFRHeads(nn.Module):
+    """DDP-friendly wrapper with shared cell-type layers and modality heads."""
+
+    def __init__(
+        self,
+        heads: dict[str, nn.Module],
+        cell_types_by_modality: dict[str, list[str]] | None = None,
+        embedding_dim: int = EMBEDDING_128BP_DIM,
+        cell_embedding_dim: int = 16,
+    ):
+        super().__init__()
+        if cell_embedding_dim < 1:
+            raise ValueError(
+                f"cell_embedding_dim must be >= 1, got {cell_embedding_dim}"
+            )
         self.heads = nn.ModuleDict(heads)
+        self.modality_layers = nn.ModuleDict({
+            modality: self._create_modality_layer(cell_embedding_dim)
+            for modality in heads
+        })
+        self.cell_key_by_type = (
+            create_cell_type_key_map(cell_types_by_modality)
+            if cell_types_by_modality is not None
+            else {}
+        )
+        self.cell_layers = nn.ModuleDict({
+            cell_key: self._create_cell_layer(embedding_dim, cell_embedding_dim)
+            for cell_key in self.cell_key_by_type.values()
+        })
+        self.track_groups = nn.ModuleDict()
+        if cell_types_by_modality is not None:
+            for modality, cell_types in cell_types_by_modality.items():
+                if modality not in self.heads:
+                    continue
+                for param in self.heads[modality].convs.parameters():
+                    param.requires_grad = False
+                n_tracks = self.heads[modality].num_tracks
+                if len(cell_types) != n_tracks:
+                    raise ValueError(
+                        f"{modality}: got {len(cell_types)} cell types for "
+                        f"{n_tracks} tracks"
+                    )
+                cell_keys = [self.cell_key_by_type[cell_type] for cell_type in cell_types]
+                self.track_groups[modality] = CellTypeTrackGroups(cell_keys)
+
+    @staticmethod
+    def _create_cell_layer(
+        embedding_dim: int,
+        cell_embedding_dim: int,
+    ) -> CellTypeEmbedding:
+        return CellTypeEmbedding(embedding_dim, cell_embedding_dim)
+
+    @staticmethod
+    def _create_modality_layer(embedding_dim: int) -> nn.Conv1d:
+        layer = nn.Conv1d(embedding_dim, 1, kernel_size=1)
+        stdv = 1.0 / math.sqrt(embedding_dim)
+        nn.init.trunc_normal_(layer.weight, std=stdv)
+        nn.init.zeros_(layer.bias)
+        return layer
+
+    def _forward_cell_modality_head(
+        self,
+        modality: str,
+        embeddings: dict[int, torch.Tensor],
+        organism_idx: torch.Tensor,
+        *,
+        return_scaled: bool,
+        channels_last: bool,
+    ) -> torch.Tensor:
+        head = self.heads[modality]
+        if 128 not in embeddings:
+            raise KeyError("TFR fine-tuning heads require 128 bp embeddings")
+        if modality not in self.track_groups:
+            return head(
+                embeddings,
+                organism_idx,
+                return_scaled=return_scaled,
+                channels_last=channels_last,
+            )[128]
+
+        emb = embeddings[128]
+        groups = self.track_groups[modality]
+        modality_layer = self.modality_layers[modality]
+        modality_weight = modality_layer.weight.squeeze(-1)
+        effective_weights = []
+        effective_biases = []
+        for cell_key in groups.cell_keys:
+            cell_layer = self.cell_layers[cell_key]
+            cell_weight = cell_layer.proj.weight.squeeze(-1)
+            cell_bias = cell_layer.proj.bias
+            effective_weights.append(torch.matmul(modality_weight, cell_weight))
+            effective_bias = (
+                torch.matmul(modality_weight, cell_bias[:, None]).squeeze(-1)
+                + modality_layer.bias
+            )
+            effective_biases.append(effective_bias)
+
+        effective_weight = torch.cat(effective_weights, dim=0)
+        effective_bias = torch.cat(effective_biases, dim=0)
+        pred_by_cell = torch.einsum(
+            "bcs,oc->bos",
+            emb,
+            effective_weight.to(dtype=emb.dtype),
+        ).to(dtype=effective_bias.dtype)
+        pred_by_cell = pred_by_cell + effective_bias[None, :, None]
+
+        scaled_pred = pred_by_cell[:, groups.track_cell_indices, :]
+        residual_scale = head.residual_scales["128"][organism_idx]
+        scaled_pred = F.softplus(scaled_pred) * F.softplus(residual_scale.unsqueeze(2))
+
+        if channels_last:
+            scaled_pred = scaled_pred.transpose(1, 2)
+        if return_scaled:
+            return scaled_pred
+        return head.unscale(scaled_pred, organism_idx, 128, channels_last)
 
     def forward(
         self,
@@ -216,13 +415,14 @@ class TFRHeads(nn.Module):
         return_scaled: bool,
     ) -> dict[str, torch.Tensor]:
         return {
-            modality: head(
+            modality: self._forward_cell_modality_head(
+                modality,
                 embeddings,
                 organism_idx,
                 return_scaled=return_scaled,
                 channels_last=True,
-            )[128]
-            for modality, head in self.heads.items()
+            )
+            for modality in self.heads
         }
 
 
@@ -677,8 +877,18 @@ def save_checkpoint(
     metadata: dict[str, Any],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    heads = unwrap_heads(heads_model).heads
-    torch.save({"heads_state_dict": heads.state_dict(), "metadata": metadata}, path)
+    unwrapped = unwrap_heads(heads_model)
+    torch.save(
+        {
+            "heads_state_dict": unwrapped.state_dict(),
+            "modality_heads_state_dict": unwrapped.heads.state_dict(),
+            "heads_model_state_dict": unwrapped.state_dict(),
+            "cell_layers_state_dict": unwrapped.cell_layers.state_dict(),
+            "modality_layers_state_dict": unwrapped.modality_layers.state_dict(),
+            "metadata": metadata,
+        },
+        path,
+    )
 
 
 def format_metrics(metrics: dict[str, float], prefix: str) -> str:
@@ -854,7 +1064,22 @@ def main() -> None:
                 num_organisms=1,
                 track_means=track_means[modality],
             )
-        heads_model: nn.Module = TFRHeads(heads).to(device)
+        cell_types_by_modality = cell_types_from_target_rows({
+            modality: train_dataset.target_rows_by_modality[modality]
+            for modality in modalities
+        })
+        heads_model: nn.Module = TFRHeads(
+            heads,
+            cell_types_by_modality,
+            cell_embedding_dim=args.cell_embedding_dim,
+        ).to(device)
+        print_rank0(
+            "Cell layers: "
+            f"{len(unwrap_heads(heads_model).cell_layers)} shared ct transforms; "
+            f"cell_embedding_dim={args.cell_embedding_dim}; "
+            f"modality layers={len(unwrap_heads(heads_model).modality_layers)}",
+            rank,
+        )
         if world_size > 1:
             device_ids = [device.index] if device.type == "cuda" else None
             heads_model = DDP(
@@ -919,6 +1144,11 @@ def main() -> None:
                 ]
                 for modality in modalities
             },
+            "cell_types": cell_types_by_modality,
+            "n_cell_types": len(unwrap_heads(heads_model).cell_layers),
+            "cell_embedding_dim": args.cell_embedding_dim,
+            "n_modality_layers": len(unwrap_heads(heads_model).modality_layers),
+            "head_factorization": "cell_bottleneck_linear_then_modality_linear",
             "crop_bins_128bp": train_dataset.prediction_crop_128bp,
             "target_length_128bp": train_dataset.output_length_128bp,
             "loss": args.loss,

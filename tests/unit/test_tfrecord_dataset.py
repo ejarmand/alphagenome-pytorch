@@ -17,9 +17,12 @@ from alphagenome_pytorch.extensions.finetuning.tfrecord_dataset import (
     collate_tfr_multimodal,
 )
 from alphagenome_pytorch.extensions.finetuning.heads import create_finetuning_head
+from alphagenome_pytorch.heads import GenomeTracksHead
 from scripts.finetune_tfr_heads import (
+    TFRHeads,
     compute_loss,
     compute_regression_metrics,
+    cell_types_from_target_rows,
     new_metric_stats,
     update_metric_stats,
 )
@@ -80,6 +83,66 @@ def test_multimodal_metadata_and_modality_selection(tmp_path):
     assert dataset.target_indices_by_modality["ATAC"].tolist() == [0, 2]
     assert dataset.target_indices_by_modality["RNA"].tolist() == [1]
     assert BaskervilleTFRecordDataset.available_modalities(data_dir) == ["ATAC", "RNA"]
+
+
+def test_cell_types_from_target_rows_uses_ct_with_identifier_fallback():
+    rows = {
+        "ATAC": [
+            {"identifier": "track0", "ct": "cell_a"},
+            {"identifier": "track1", "ct": ""},
+        ],
+        "RNA": [{"identifier": "track2"}],
+    }
+
+    assert cell_types_from_target_rows(rows) == {
+        "ATAC": ["cell_a", "track1"],
+        "RNA": ["track2"],
+    }
+
+
+def test_tfr_heads_shares_cell_layers_across_modalities():
+    heads = {
+        "ATAC": GenomeTracksHead(
+            in_channels={128: 4},
+            num_tracks=2,
+            resolutions=(128,),
+            num_organisms=1,
+        ),
+        "RNA": GenomeTracksHead(
+            in_channels={128: 4},
+            num_tracks=1,
+            resolutions=(128,),
+            num_organisms=1,
+            apply_squashing=True,
+        ),
+    }
+    model = TFRHeads(
+        heads,
+        cell_types_by_modality={
+            "ATAC": ["shared_ct", "atac_only"],
+            "RNA": ["shared_ct"],
+        },
+        embedding_dim=4,
+        cell_embedding_dim=2,
+    )
+
+    assert len(model.cell_layers) == 2
+    assert len(model.modality_layers) == 2
+    assert model.modality_layers["ATAC"].out_channels == 1
+    assert model.modality_layers["RNA"].out_channels == 1
+    shared_key = model.cell_key_by_type["shared_ct"]
+    assert model.cell_layers[shared_key].proj.in_channels == 4
+    assert model.cell_layers[shared_key].proj.out_channels == 2
+    assert shared_key in model.track_groups["ATAC"].cell_keys
+    assert shared_key in model.track_groups["RNA"].cell_keys
+
+    embeddings = {128: torch.randn(2, 4, 3)}
+    organism_idx = torch.zeros(2, dtype=torch.long)
+
+    outputs = model(embeddings, organism_idx, return_scaled=True)
+
+    assert outputs["ATAC"].shape == (2, 3, 2)
+    assert outputs["RNA"].shape == (2, 3, 1)
 
 
 def test_worker_files_shards_by_rank(tmp_path):
