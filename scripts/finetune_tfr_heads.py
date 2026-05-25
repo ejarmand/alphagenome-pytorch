@@ -64,21 +64,29 @@ def parse_args() -> argparse.Namespace:
             "forking TFRecord workers after CUDA/DDP initialization."
         ),
     )
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument(
+        "--prefetch-n",
+        type=int,
+        default=1,
+        help=(
+            "DataLoader prefetch_factor when workers are enabled. Ignored when "
+            "the effective worker count is 0."
+        ),
+    )
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument(
         "--warmup-steps",
         type=int,
-        default=None,
+        default=500,
         help=(
-            "Warmup optimizer steps. Defaults to 1% of estimated optimizer steps. "
-            "Set 0 to disable warmup."
+            "Warmup optimizer steps. Set 0 to disable warmup."
         ),
     )
     parser.add_argument(
         "--lr-schedule",
         choices=["constant", "cosine"],
-        default="constant",
+        default="cosine",
         help="Learning rate schedule after optional warmup.",
     )
     parser.add_argument(
@@ -169,8 +177,11 @@ def create_loader(
     batch_size: int,
     num_workers: int,
     *,
+    prefetch_n: int = 1,
     persistent_workers: bool = False,
 ) -> DataLoader:
+    if prefetch_n < 1:
+        raise ValueError(f"prefetch_n must be >= 1, got {prefetch_n}")
     local_files = dataset._worker_files()
     effective_workers = min(num_workers, len(local_files)) if num_workers > 0 else 0
     return DataLoader(
@@ -179,7 +190,7 @@ def create_loader(
         num_workers=effective_workers,
         collate_fn=collate_tfr_multimodal,
         pin_memory=torch.cuda.is_available(),
-        prefetch_factor=1 if effective_workers > 0 else None,
+        prefetch_factor=prefetch_n if effective_workers > 0 else None,
         persistent_workers=persistent_workers and effective_workers > 0,
     )
 
@@ -291,6 +302,26 @@ class CellTypeEmbedding(nn.Module):
         return self.proj(x)
 
 
+class ModalityDecoder(nn.Module):
+    """Shared per-modality decoder from cell embeddings to one track value."""
+
+    def __init__(self, embedding_dim: int):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Conv1d(embedding_dim, embedding_dim, kernel_size=1),
+            nn.GELU(),
+            nn.Conv1d(embedding_dim, 1, kernel_size=1),
+        )
+        for layer in self.layers:
+            if isinstance(layer, nn.Conv1d):
+                stdv = 1.0 / math.sqrt(layer.in_channels)
+                nn.init.trunc_normal_(layer.weight, std=stdv)
+                nn.init.zeros_(layer.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.layers(x)
+
+
 class TFRHeads(nn.Module):
     """DDP-friendly wrapper with shared cell-type layers and modality heads."""
 
@@ -344,12 +375,8 @@ class TFRHeads(nn.Module):
         return CellTypeEmbedding(embedding_dim, cell_embedding_dim)
 
     @staticmethod
-    def _create_modality_layer(embedding_dim: int) -> nn.Conv1d:
-        layer = nn.Conv1d(embedding_dim, 1, kernel_size=1)
-        stdv = 1.0 / math.sqrt(embedding_dim)
-        nn.init.trunc_normal_(layer.weight, std=stdv)
-        nn.init.zeros_(layer.bias)
-        return layer
+    def _create_modality_layer(embedding_dim: int) -> ModalityDecoder:
+        return ModalityDecoder(embedding_dim)
 
     def _forward_cell_modality_head(
         self,
@@ -374,28 +401,26 @@ class TFRHeads(nn.Module):
         emb = embeddings[128]
         groups = self.track_groups[modality]
         modality_layer = self.modality_layers[modality]
-        modality_weight = modality_layer.weight.squeeze(-1)
-        effective_weights = []
-        effective_biases = []
-        for cell_key in groups.cell_keys:
-            cell_layer = self.cell_layers[cell_key]
-            cell_weight = cell_layer.proj.weight.squeeze(-1)
-            cell_bias = cell_layer.proj.bias
-            effective_weights.append(torch.matmul(modality_weight, cell_weight))
-            effective_bias = (
-                torch.matmul(modality_weight, cell_bias[:, None]).squeeze(-1)
-                + modality_layer.bias
-            )
-            effective_biases.append(effective_bias)
 
-        effective_weight = torch.cat(effective_weights, dim=0)
-        effective_bias = torch.cat(effective_biases, dim=0)
-        pred_by_cell = torch.einsum(
-            "bcs,oc->bos",
+        cell_weights = torch.stack([
+            self.cell_layers[cell_key].proj.weight.squeeze(-1)
+            for cell_key in groups.cell_keys
+        ])
+        cell_biases = torch.stack([
+            self.cell_layers[cell_key].proj.bias
+            for cell_key in groups.cell_keys
+        ])
+        cell_embeddings = torch.einsum(
+            "bcs,nhc->bnhs",
             emb,
-            effective_weight.to(dtype=emb.dtype),
-        ).to(dtype=effective_bias.dtype)
-        pred_by_cell = pred_by_cell + effective_bias[None, :, None]
+            cell_weights.to(dtype=emb.dtype),
+        )
+        cell_embeddings = cell_embeddings + cell_biases.to(dtype=emb.dtype)[None, :, :, None]
+        batch_size, n_cells, cell_dim, seq_len = cell_embeddings.shape
+        pred_by_cell = modality_layer(
+            cell_embeddings.reshape(batch_size * n_cells, cell_dim, seq_len)
+        )
+        pred_by_cell = pred_by_cell.reshape(batch_size, n_cells, seq_len)
 
         scaled_pred = pred_by_cell[:, groups.track_cell_indices, :]
         residual_scale = head.residual_scales["128"][organism_idx]
@@ -655,6 +680,20 @@ def compute_regression_metrics(stats: torch.Tensor) -> dict[str, float]:
     }
 
 
+@torch.no_grad()
+def compute_gradient_norm(module: nn.Module) -> torch.Tensor:
+    total = None
+    for param in module.parameters():
+        if param.grad is None:
+            continue
+        grad_norm = param.grad.detach().float().norm(2).square()
+        total = grad_norm if total is None else total + grad_norm
+    if total is None:
+        device = next(module.parameters()).device
+        return torch.tensor(0.0, device=device)
+    return total.sqrt()
+
+
 def forward_heads(
     model: torch.nn.Module,
     heads_model: nn.Module,
@@ -719,7 +758,7 @@ def run_epoch(
     max_steps: int | None,
     rank: int,
     world_size: int,
-) -> tuple[float, dict[str, float]]:
+) -> tuple[float, dict[str, float], dict[str, float]]:
     training = optimizer is not None
     heads_model.train(training)
     model.eval()
@@ -727,6 +766,9 @@ def run_epoch(
         raise ValueError("--gradient-accumulation-steps must be >= 1")
     total_loss = torch.tensor(0.0, device=device)
     total_steps = torch.tensor(0.0, device=device)
+    grad_norm_sum = torch.tensor(0.0, device=device)
+    grad_norm_count = torch.tensor(0.0, device=device)
+    grad_norm_max = torch.tensor(0.0, device=device)
     metric_stats: dict[str, torch.Tensor] = {}
     steps = 0
     accumulated_steps = 0
@@ -817,6 +859,10 @@ def run_epoch(
             (loss / args.gradient_accumulation_steps).backward()
             accumulated_steps += 1
             if accumulated_steps == args.gradient_accumulation_steps:
+                grad_norm = compute_gradient_norm(heads_model)
+                grad_norm_sum += grad_norm
+                grad_norm_count += 1
+                grad_norm_max = torch.maximum(grad_norm_max, grad_norm)
                 optimizer.step()
                 if scheduler is not None:
                     scheduler.step()
@@ -839,6 +885,10 @@ def run_epoch(
     pbar.close()
 
     if training and accumulated_steps > 0:
+        grad_norm = compute_gradient_norm(heads_model)
+        grad_norm_sum += grad_norm
+        grad_norm_count += 1
+        grad_norm_max = torch.maximum(grad_norm_max, grad_norm)
         optimizer.step()
         if scheduler is not None:
             scheduler.step()
@@ -847,10 +897,17 @@ def run_epoch(
     if world_size > 1:
         dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_steps, op=dist.ReduceOp.SUM)
+        dist.all_reduce(grad_norm_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(grad_norm_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(grad_norm_max, op=dist.ReduceOp.MAX)
         for stats in metric_stats.values():
             dist.all_reduce(stats, op=dist.ReduceOp.SUM)
 
     metrics: dict[str, float] = {}
+    grad_metrics: dict[str, float] = {}
+    if training and grad_norm_count.item() > 0:
+        grad_metrics["grad_norm"] = (grad_norm_sum / grad_norm_count).item()
+        grad_metrics["grad_norm_max"] = grad_norm_max.item()
     for modality, stats in metric_stats.items():
         modality_metrics = compute_regression_metrics(stats)
         metrics[f"{modality}_pearson_r"] = modality_metrics["pearson_r"]
@@ -868,7 +925,7 @@ def run_epoch(
     if r2_values:
         metrics["mean_r2"] = sum(r2_values) / len(r2_values)
 
-    return (total_loss / total_steps.clamp_min(1)).item(), metrics
+    return (total_loss / total_steps.clamp_min(1)).item(), metrics, grad_metrics
 
 
 def save_checkpoint(
@@ -981,12 +1038,14 @@ def main() -> None:
             train_dataset,
             args.batch_size,
             args.num_workers,
+            prefetch_n=args.prefetch_n,
             persistent_workers=True,
         )
         val_loader = create_loader(
             val_dataset,
             args.batch_size,
             args.val_num_workers,
+            prefetch_n=args.prefetch_n,
             persistent_workers=False,
         )
         print_rank0(
@@ -996,6 +1055,7 @@ def main() -> None:
                     f"valid={len(val_dataset._worker_files())}",
                     f"DataLoader workers: train={train_loader.num_workers}",
                     f"valid={val_loader.num_workers}",
+                    f"prefetch_n={args.prefetch_n}",
                     f"tf_parallel_reads={args.tfr_num_parallel_reads}",
                 )
             ),
@@ -1148,7 +1208,7 @@ def main() -> None:
             "n_cell_types": len(unwrap_heads(heads_model).cell_layers),
             "cell_embedding_dim": args.cell_embedding_dim,
             "n_modality_layers": len(unwrap_heads(heads_model).modality_layers),
-            "head_factorization": "cell_bottleneck_linear_then_modality_linear",
+            "head_factorization": "cell_bottleneck_linear_then_modality_mlp",
             "crop_bins_128bp": train_dataset.prediction_crop_128bp,
             "target_length_128bp": train_dataset.output_length_128bp,
             "loss": args.loss,
@@ -1157,6 +1217,7 @@ def main() -> None:
             "batch_size": args.batch_size,
             "num_workers": args.num_workers,
             "val_num_workers": args.val_num_workers,
+            "prefetch_n": args.prefetch_n,
             "epochs": args.epochs,
             "lr": args.lr,
             "lr_schedule": args.lr_schedule,
@@ -1175,7 +1236,7 @@ def main() -> None:
         best_val = float("inf")
         for epoch in range(1, args.epochs + 1):
             print_rank0(f"Epoch {epoch}/{args.epochs}", rank)
-            train_loss, train_metrics = run_epoch(
+            train_loss, train_metrics, train_grad_metrics = run_epoch(
                 model,
                 heads_model,
                 train_loader,
@@ -1188,7 +1249,7 @@ def main() -> None:
                 rank,
                 world_size,
             )
-            val_loss, val_metrics = run_epoch(
+            val_loss, val_metrics, _ = run_epoch(
                 model,
                 heads_model,
                 val_loader,
@@ -1210,6 +1271,10 @@ def main() -> None:
             epoch_log.update({
                 f"train/{key}": value
                 for key, value in train_metrics.items()
+            })
+            epoch_log.update({
+                f"train/{key}": value
+                for key, value in train_grad_metrics.items()
             })
             epoch_log.update({
                 f"val/{key}": value

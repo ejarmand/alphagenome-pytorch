@@ -128,8 +128,10 @@ def test_tfr_heads_shares_cell_layers_across_modalities():
 
     assert len(model.cell_layers) == 2
     assert len(model.modality_layers) == 2
-    assert model.modality_layers["ATAC"].out_channels == 1
-    assert model.modality_layers["RNA"].out_channels == 1
+    assert model.modality_layers["ATAC"].layers[0].out_channels == 2
+    assert model.modality_layers["ATAC"].layers[2].out_channels == 1
+    assert model.modality_layers["RNA"].layers[0].out_channels == 2
+    assert model.modality_layers["RNA"].layers[2].out_channels == 1
     shared_key = model.cell_key_by_type["shared_ct"]
     assert model.cell_layers[shared_key].proj.in_channels == 4
     assert model.cell_layers[shared_key].proj.out_channels == 2
