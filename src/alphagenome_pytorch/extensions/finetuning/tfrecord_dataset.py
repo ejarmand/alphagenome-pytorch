@@ -171,6 +171,7 @@ class BaskervilleTFRecordDataset(IterableDataset):
         self.world_size = world_size
         self.augment_rc = augment_rc
         self.augment_shift = augment_shift
+        self._augmentation_iteration = 0
 
         self.metadata = self._load_metadata(self.data_dir)
         self.files = self._get_tfrecord_files(self.data_dir, split)
@@ -346,13 +347,23 @@ class BaskervilleTFRecordDataset(IterableDataset):
     def _shift_sequence(sequence: np.ndarray, shift: int) -> np.ndarray:
         return shift_onehot(sequence, shift)
 
-    def _augmentation_rng(self) -> random.Random:
+    def _next_augmentation_iteration(self) -> int:
+        iteration = self._augmentation_iteration
+        self._augmentation_iteration += 1
+        return iteration
+
+    def _augmentation_rng(self, iteration: int) -> random.Random:
         worker = get_worker_info()
         worker_id = worker.id if worker is not None else 0
         rank = self.rank
         if dist.is_available() and dist.is_initialized():
             rank = dist.get_rank()
-        return random.Random(self.seed + rank * 1009 + worker_id * 9176)
+        return random.Random(
+            self.seed
+            + rank * 1009
+            + worker_id * 9176
+            + iteration * 104729
+        )
 
     def _augment_sequence(
         self,
@@ -376,14 +387,27 @@ class BaskervilleTFRecordDataset(IterableDataset):
         indices: list[int],
         rows: list[dict[str, str]],
     ) -> np.ndarray:
+        row_indices = []
+        for local_idx, row in enumerate(rows):
+            try:
+                row_indices.append(int(row.get("index", indices[local_idx])))
+            except (TypeError, ValueError):
+                row_indices.append(indices[local_idx])
+
         index_to_local = {int(index): local for local, index in enumerate(indices)}
+        row_index_to_local = {row_index: local for local, row_index in enumerate(row_indices)}
         pairs = []
         for local_idx, row in enumerate(rows):
             try:
-                pair_index = int(row.get("strand_pair", indices[local_idx]))
+                pair_index = int(row.get("strand_pair", row_indices[local_idx]))
             except (TypeError, ValueError):
-                pair_index = indices[local_idx]
-            pairs.append(index_to_local.get(pair_index, local_idx))
+                pair_index = row_indices[local_idx]
+            pairs.append(
+                row_index_to_local.get(
+                    pair_index,
+                    index_to_local.get(pair_index, local_idx),
+                )
+            )
         return np.asarray(pairs, dtype=np.int64)
 
     def _worker_files(self) -> list[Path]:
@@ -447,7 +471,7 @@ class BaskervilleTFRecordDataset(IterableDataset):
         files = self._worker_files()
         if not files:
             return
-        rng = self._augmentation_rng()
+        rng = self._augmentation_rng(self._next_augmentation_iteration())
 
         while True:
             dataset = self._tf_dataset(files)
@@ -551,7 +575,7 @@ class BaskervilleMultiTFRecordDataset(BaskervilleTFRecordDataset):
         files = self._worker_files()
         if not files:
             return
-        rng = self._augmentation_rng()
+        rng = self._augmentation_rng(self._next_augmentation_iteration())
 
         while True:
             dataset = self._tf_dataset(files)

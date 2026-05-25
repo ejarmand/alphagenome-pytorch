@@ -241,6 +241,58 @@ def test_modality_selection_uses_row_positions_for_filtered_targets(tmp_path):
     assert dataset.target_indices.tolist() == [1]
 
 
+def test_strand_pair_uses_global_row_indices_when_targets_are_filtered(tmp_path):
+    data_dir = _write_minimal_dataset(tmp_path)
+    (data_dir / "statistics.json").write_text(
+        json.dumps(
+            {
+                "num_targets": 2,
+                "seq_length": 8,
+                "pool_width": 32,
+                "crop_bp": 128,
+                "target_length": 8,
+                "train_seqs": 2,
+            }
+        )
+    )
+    (data_dir / "targets.txt").write_text(
+        "\t".join(["index", "identifier", "modality", "strand_pair"]) + "\n"
+        "5\tcell+\tRNA\t6\n"
+        "6\tcell-\tRNA\t5\n"
+    )
+
+    dataset = BaskervilleMultiTFRecordDataset(data_dir, modalities=["RNA"])
+
+    assert dataset.target_indices_by_modality["RNA"].tolist() == [0, 1]
+    assert dataset.strand_pair_by_modality["RNA"].tolist() == [1, 0]
+
+
+def test_augmentation_rng_advances_between_dataset_iterations(tmp_path):
+    data_dir = _write_minimal_dataset(tmp_path)
+    dataset = BaskervilleTFRecordDataset(
+        data_dir,
+        modality="ATAC",
+        augment_rc=True,
+        augment_shift=3,
+        seed=7,
+    )
+
+    first_iteration = dataset._next_augmentation_iteration()
+    second_iteration = dataset._next_augmentation_iteration()
+    first_values = [
+        dataset._augmentation_rng(first_iteration).random()
+        for _ in range(3)
+    ]
+    second_values = [
+        dataset._augmentation_rng(second_iteration).random()
+        for _ in range(3)
+    ]
+
+    assert first_iteration == 0
+    assert second_iteration == 1
+    assert first_values != second_values
+
+
 def test_decode_sequence_accepts_indices_and_onehot():
     indexed = np.array([0, 1, 2, 3, 4], dtype=np.uint8)
     decoded = BaskervilleTFRecordDataset._decode_sequence(indexed.tobytes(), 5)
