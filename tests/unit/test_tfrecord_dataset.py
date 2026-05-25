@@ -73,6 +73,22 @@ def test_metadata_files_and_modality_selection(tmp_path):
     assert dataset.assay_type == "atac"
     assert dataset.prediction_crop_128bp == 1
     assert dataset.output_length_128bp == 2
+    assert dataset.prediction_crop_bins == 1
+    assert dataset.output_length == 2
+
+
+def test_metadata_32bp_resolution_uses_raw_target_bins(tmp_path):
+    data_dir = _write_minimal_dataset(tmp_path)
+
+    dataset = BaskervilleTFRecordDataset(
+        data_dir,
+        modality="ATAC",
+        target_resolution=32,
+    )
+
+    assert dataset.target_resolution == 32
+    assert dataset.prediction_crop_bins == 4
+    assert dataset.output_length == 8
 
 
 def test_multimodal_metadata_and_modality_selection(tmp_path):
@@ -166,6 +182,31 @@ def test_tfr_heads_shares_cell_layers_across_modalities():
 
     assert outputs["ATAC"].shape == (2, 3, 2)
     assert outputs["RNA"].shape == (2, 3, 1)
+
+
+def test_tfr_heads_32bp_unet_upsamples_fourfold():
+    heads = {
+        "ATAC": GenomeTracksHead(
+            in_channels={128: 4},
+            num_tracks=2,
+            resolutions=(128,),
+            num_organisms=1,
+        ),
+    }
+    model = TFRHeads(
+        heads,
+        cell_types_by_modality={"ATAC": ["cell_a", "cell_b"]},
+        embedding_dim=4,
+        cell_embedding_dim=2,
+        target_resolution=32,
+    )
+    embeddings = {128: torch.randn(2, 4, 3)}
+    organism_idx = torch.zeros(2, dtype=torch.long)
+
+    outputs = model(embeddings, organism_idx, return_scaled=True)
+
+    assert outputs["ATAC"].shape == (2, 12, 2)
+    assert model.modality_layers["ATAC"].target_resolution == 32
 
 
 def test_worker_files_shards_by_rank(tmp_path):
@@ -387,6 +428,21 @@ def test_decode_and_pool_targets(tmp_path):
     np.testing.assert_allclose(pooled, selected.reshape(2, 4, 2).mean(axis=1))
 
 
+def test_decode_targets_at_32bp_resolution_are_unpooled(tmp_path):
+    data_dir = _write_minimal_dataset(tmp_path)
+    dataset = BaskervilleTFRecordDataset(
+        data_dir,
+        modality="ATAC",
+        target_resolution=32,
+    )
+
+    raw = np.arange(24, dtype=np.float16).reshape(8, 3)
+    selected = dataset._decode_target(raw.tobytes())
+    target = dataset._target_for_resolution(selected)
+
+    np.testing.assert_array_equal(target, raw[:, [0, 2]].astype(np.float32))
+
+
 def test_collate_tfr_genomic():
     seq0 = torch.zeros(4, 4)
     seq1 = torch.ones(4, 4)
@@ -437,6 +493,7 @@ def test_poisson_multinomial_loss_alias_runs():
         loss_name="poisson-multinomial",
         head=head,
         organism_idx=organism_idx,
+        target_resolution=128,
         positional_weight=5.0,
         count_weight=1.0,
     )

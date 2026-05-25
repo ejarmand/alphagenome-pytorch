@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Fine-tune frozen AlphaGenome 128 bp heads from Baskerville TFRecords."""
+"""Fine-tune frozen AlphaGenome heads from Baskerville TFRecords."""
 
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ from alphagenome_pytorch.losses import multinomial_loss
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train a new 128 bp AlphaGenome head from Baskerville TFRecords.",
+        description="Train a new AlphaGenome head from Baskerville TFRecords.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--data-dir", type=Path, required=True)
@@ -52,6 +52,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--pooling", choices=["mean", "sum"], default="mean")
+    parser.add_argument(
+        "--target-resolution",
+        type=int,
+        choices=[32, 128],
+        default=128,
+        help=(
+            "Target bin size to train against. 128 pools four raw 32 bp TFRecord "
+            "bins; 32 trains on raw TFRecord targets using a 4x U-Net upsampler."
+        ),
+    )
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -169,6 +179,7 @@ def create_tfr_dataset(
     split: str,
     modalities: list[str],
     pooling: str,
+    target_resolution: int,
     *,
     repeat: bool = False,
     shuffle_files: bool = False,
@@ -183,6 +194,7 @@ def create_tfr_dataset(
         split=split,  # type: ignore[arg-type]
         modalities=modalities,
         pooling=pooling,  # type: ignore[arg-type]
+        target_resolution=target_resolution,  # type: ignore[arg-type]
         repeat=repeat,
         shuffle_files=shuffle_files,
         num_parallel_reads=num_parallel_reads,
@@ -339,8 +351,17 @@ class CellTypeEmbedding(nn.Module):
 class ModalityDecoder(nn.Module):
     """Shared per-modality decoder from cell embeddings to one track value."""
 
-    def __init__(self, embedding_dim: int):
+    def __init__(self, embedding_dim: int, target_resolution: int = 128):
         super().__init__()
+        self.target_resolution = target_resolution
+        if target_resolution == 32:
+            self.upscaler = UNet32bpUpsampler(embedding_dim)
+        elif target_resolution == 128:
+            self.upscaler = nn.Identity()
+        else:
+            raise ValueError(
+                f"target_resolution must be 32 or 128, got {target_resolution}"
+            )
         self.layers = nn.Sequential(
             nn.Conv1d(embedding_dim, embedding_dim, kernel_size=1),
             nn.GELU(),
@@ -353,7 +374,55 @@ class ModalityDecoder(nn.Module):
                 nn.init.zeros_(layer.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.layers(x)
+        return self.layers(self.upscaler(x))
+
+
+class ConvNormGelu(nn.Module):
+    """Small NCL convolution block used by the 32 bp fine-tuning upsampler."""
+
+    def __init__(self, channels: int, kernel_size: int = 5):
+        super().__init__()
+        self.norm = nn.GroupNorm(1, channels)
+        self.conv = nn.Conv1d(
+            channels,
+            channels,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2,
+        )
+        stdv = 1.0 / math.sqrt(channels * kernel_size)
+        nn.init.trunc_normal_(self.conv.weight, std=stdv)
+        nn.init.zeros_(self.conv.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(F.gelu(self.norm(x)))
+
+
+class UNet32bpUpsampler(nn.Module):
+    """Upscale 128 bp cell embeddings to 32 bp bins with a compact 1D U-Net."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.stem = ConvNormGelu(channels)
+        self.down = ConvNormGelu(channels)
+        self.bottleneck = ConvNormGelu(channels)
+        self.low_refine = ConvNormGelu(channels)
+        self.up_refine_64bp = ConvNormGelu(channels)
+        self.up_refine_32bp = ConvNormGelu(channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        skip_128bp = x + self.stem(x)
+        low = F.avg_pool1d(skip_128bp, kernel_size=2, stride=2, ceil_mode=True)
+        low = low + self.down(low)
+        low = low + self.bottleneck(low)
+
+        up_128bp = F.interpolate(low, size=skip_128bp.shape[-1], mode="nearest")
+        up_128bp = skip_128bp + self.low_refine(up_128bp)
+
+        up_64bp = F.interpolate(up_128bp, scale_factor=2, mode="nearest")
+        up_64bp = up_64bp + self.up_refine_64bp(up_64bp)
+
+        up_32bp = F.interpolate(up_64bp, scale_factor=2, mode="nearest")
+        return up_32bp + self.up_refine_32bp(up_32bp)
 
 
 class TFRHeads(nn.Module):
@@ -365,15 +434,21 @@ class TFRHeads(nn.Module):
         cell_types_by_modality: dict[str, list[str]] | None = None,
         embedding_dim: int = EMBEDDING_128BP_DIM,
         cell_embedding_dim: int = 16,
+        target_resolution: int = 128,
     ):
         super().__init__()
         if cell_embedding_dim < 1:
             raise ValueError(
                 f"cell_embedding_dim must be >= 1, got {cell_embedding_dim}"
             )
+        if target_resolution not in (32, 128):
+            raise ValueError(
+                f"target_resolution must be 32 or 128, got {target_resolution}"
+            )
+        self.target_resolution = target_resolution
         self.heads = nn.ModuleDict(heads)
         self.modality_layers = nn.ModuleDict({
-            modality: self._create_modality_layer(cell_embedding_dim)
+            modality: self._create_modality_layer(cell_embedding_dim, target_resolution)
             for modality in heads
         })
         self.cell_key_by_type = (
@@ -409,8 +484,11 @@ class TFRHeads(nn.Module):
         return CellTypeEmbedding(embedding_dim, cell_embedding_dim)
 
     @staticmethod
-    def _create_modality_layer(embedding_dim: int) -> ModalityDecoder:
-        return ModalityDecoder(embedding_dim)
+    def _create_modality_layer(
+        embedding_dim: int,
+        target_resolution: int,
+    ) -> ModalityDecoder:
+        return ModalityDecoder(embedding_dim, target_resolution)
 
     def _forward_cell_modality_head(
         self,
@@ -454,7 +532,8 @@ class TFRHeads(nn.Module):
         pred_by_cell = modality_layer(
             cell_embeddings.reshape(batch_size * n_cells, cell_dim, seq_len)
         )
-        pred_by_cell = pred_by_cell.reshape(batch_size, n_cells, seq_len)
+        output_len = pred_by_cell.shape[-1]
+        pred_by_cell = pred_by_cell.reshape(batch_size, n_cells, output_len)
 
         scaled_pred = pred_by_cell[:, groups.track_cell_indices, :]
         residual_scale = head.residual_scales["128"][organism_idx]
@@ -464,7 +543,12 @@ class TFRHeads(nn.Module):
             scaled_pred = scaled_pred.transpose(1, 2)
         if return_scaled:
             return scaled_pred
-        return head.unscale(scaled_pred, organism_idx, 128, channels_last)
+        return head.unscale(
+            scaled_pred,
+            organism_idx,
+            self.target_resolution,
+            channels_last,
+        )
 
     def forward(
         self,
@@ -568,11 +652,18 @@ def estimate_track_means(
     data_dir: Path,
     modalities: list[str],
     pooling: str,
+    target_resolution: int,
     max_samples: int,
     batch_size: int,
     num_workers: int,
 ) -> dict[str, torch.Tensor]:
-    dataset = create_tfr_dataset(data_dir, "train", modalities, pooling)
+    dataset = create_tfr_dataset(
+        data_dir,
+        "train",
+        modalities,
+        pooling,
+        target_resolution,
+    )
     if max_samples <= 0:
         return {
             modality: torch.ones(1, len(dataset.target_indices_by_modality[modality]))
@@ -590,10 +681,10 @@ def estimate_track_means(
     for sequences, modality_targets in loader:
         del sequences
         for modality, targets in modality_targets.items():
-            target = targets[128].double()
+            target = targets[target_resolution].double()
             sums[modality] += target.sum(dim=(0, 1))
             position_counts[modality] += target.shape[0] * target.shape[1]
-        samples_seen += next(iter(modality_targets.values()))[128].shape[0]
+        samples_seen += next(iter(modality_targets.values()))[target_resolution].shape[0]
         if samples_seen >= max_samples:
             break
 
@@ -665,6 +756,7 @@ def compute_loss(
     loss_name: str,
     head: torch.nn.Module,
     organism_idx: torch.Tensor,
+    target_resolution: int,
     positional_weight: float,
     count_weight: float,
 ) -> torch.Tensor:
@@ -679,7 +771,12 @@ def compute_loss(
             reduction="mean",
         )
     if loss_name in ("poisson-multinomial", "multinomial"):
-        target_scaled = head.scale(target, organism_idx, resolution=128, channels_last=True)
+        target_scaled = head.scale(
+            target,
+            organism_idx,
+            resolution=target_resolution,
+            channels_last=True,
+        )
         mask = torch.ones(
             pred.shape[0],
             1,
@@ -928,7 +1025,10 @@ def run_epoch(
         loss = torch.tensor(0.0, device=device)
         loss_by_modality = {}
         for modality, pred in predictions_by_modality.items():
-            target = modality_targets[modality][128].to(device, non_blocking=True)
+            target = modality_targets[modality][args.target_resolution].to(
+                device,
+                non_blocking=True,
+            )
             if pred.shape != target.shape:
                 raise ValueError(
                     f"{modality}: prediction shape {tuple(pred.shape)} does not "
@@ -940,6 +1040,7 @@ def run_epoch(
                 loss_name=args.loss,
                 head=heads[modality],
                 organism_idx=organism_idx,
+                target_resolution=args.target_resolution,
                 positional_weight=args.positional_weight,
                 count_weight=args.count_weight,
             )
@@ -1118,6 +1219,7 @@ def main() -> None:
             "train",
             modalities,
             args.pooling,
+            args.target_resolution,
             repeat=False,
             shuffle_files=True,
             num_parallel_reads=args.tfr_num_parallel_reads,
@@ -1131,6 +1233,7 @@ def main() -> None:
             "valid",
             modalities,
             args.pooling,
+            args.target_resolution,
             num_parallel_reads=args.tfr_num_parallel_reads,
             rank=rank,
             world_size=world_size,
@@ -1172,10 +1275,11 @@ def main() -> None:
             f"seq={tuple(sample_sequences.shape)} "
             + "targets="
             + ",".join(
-                f"{modality}:{tuple(targets[128].shape)}"
+                f"{modality}:{tuple(targets[args.target_resolution].shape)}"
                 for modality, targets in sample_targets.items()
             )
-            + f" crop_bins={train_dataset.prediction_crop_128bp}"
+            + f" crop_bins={train_dataset.prediction_crop_bins}"
+            + f" target_resolution={args.target_resolution}"
             + f" modalities={modalities}",
             rank,
         )
@@ -1208,6 +1312,7 @@ def main() -> None:
                 args.data_dir,
                 modalities,
                 args.pooling,
+                args.target_resolution,
                 args.track_means_samples,
                 args.batch_size,
                 args.num_workers,
@@ -1245,6 +1350,7 @@ def main() -> None:
             heads,
             cell_types_by_modality,
             cell_embedding_dim=args.cell_embedding_dim,
+            target_resolution=args.target_resolution,
         ).to(device)
         print_rank0(
             "Cell layers: "
@@ -1306,6 +1412,7 @@ def main() -> None:
             "modalities": modalities,
             "assay_types": train_dataset.assay_type_by_modality,
             "pooling": args.pooling,
+            "target_resolution": args.target_resolution,
             "n_tracks": {
                 modality: len(train_dataset.target_indices_by_modality[modality])
                 for modality in modalities
@@ -1325,7 +1432,13 @@ def main() -> None:
             "n_cell_types": len(unwrap_heads(heads_model).cell_layers),
             "cell_embedding_dim": args.cell_embedding_dim,
             "n_modality_layers": len(unwrap_heads(heads_model).modality_layers),
-            "head_factorization": "cell_bottleneck_linear_then_modality_mlp",
+            "head_factorization": (
+                "cell_bottleneck_linear_then_unet32bp_modality_mlp"
+                if args.target_resolution == 32
+                else "cell_bottleneck_linear_then_modality_mlp"
+            ),
+            "crop_bins": train_dataset.prediction_crop_bins,
+            "target_length": train_dataset.output_length,
             "crop_bins_128bp": train_dataset.prediction_crop_128bp,
             "target_length_128bp": train_dataset.output_length_128bp,
             "loss": args.loss,
@@ -1363,7 +1476,7 @@ def main() -> None:
                 optimizer,
                 scheduler,
                 args,
-                train_dataset.prediction_crop_128bp,
+                train_dataset.prediction_crop_bins,
                 args.max_train_steps,
                 rank,
                 world_size,
@@ -1376,7 +1489,7 @@ def main() -> None:
                 None,
                 None,
                 args,
-                val_dataset.prediction_crop_128bp,
+                val_dataset.prediction_crop_bins,
                 args.max_val_steps,
                 rank,
                 world_size,

@@ -27,6 +27,7 @@ from alphagenome_pytorch.utils.sequence import (
 
 _Pooling = Literal["mean", "sum"]
 _Split = Literal["train", "valid", "test"]
+_TargetResolution = Literal[32, 128]
 
 __all__ = [
     "BaskervilleTFRecordDataset",
@@ -61,21 +62,55 @@ class _TFRecordDatasetMetadata:
 
     @property
     def output_length_128bp(self) -> int:
-        if self.target_length % 4 != 0:
+        factor = self._factor_to_resolution(128)
+        if self.target_length % factor != 0:
             raise ValueError(
-                f"target_length={self.target_length} is not divisible by 4, "
+                f"target_length={self.target_length} is not divisible by {factor}, "
                 "so 32 bp targets cannot be pooled to 128 bp bins."
             )
-        return self.target_length // 4
+        return self.target_length // factor
 
     @property
     def prediction_crop_128bp(self) -> int:
-        if self.crop_bp % 128 != 0:
+        return self.prediction_crop_bins(128)
+
+    @property
+    def output_length_32bp(self) -> int:
+        self._validate_resolution(32)
+        return self.target_length
+
+    @property
+    def prediction_crop_32bp(self) -> int:
+        return self.prediction_crop_bins(32)
+
+    def output_length(self, resolution: int) -> int:
+        if resolution == 32:
+            return self.output_length_32bp
+        if resolution == 128:
+            return self.output_length_128bp
+        raise ValueError(f"Unsupported target resolution {resolution}; expected 32 or 128")
+
+    def prediction_crop_bins(self, resolution: int) -> int:
+        self._validate_resolution(resolution)
+        if self.crop_bp % resolution != 0:
             raise ValueError(
-                f"crop_bp={self.crop_bp} is not divisible by 128, so prediction "
-                "crop cannot be represented at 128 bp resolution."
+                f"crop_bp={self.crop_bp} is not divisible by {resolution}, so "
+                "prediction crop cannot be represented at that resolution."
             )
-        return self.crop_bp // 128
+        return self.crop_bp // resolution
+
+    def _validate_resolution(self, resolution: int) -> None:
+        if resolution not in (32, 128):
+            raise ValueError(f"Unsupported target resolution {resolution}; expected 32 or 128")
+        if resolution % self.pool_width != 0:
+            raise ValueError(
+                f"target resolution {resolution} is not a multiple of "
+                f"pool_width={self.pool_width}"
+            )
+
+    def _factor_to_resolution(self, resolution: int) -> int:
+        self._validate_resolution(resolution)
+        return resolution // self.pool_width
 
 
 def _natural_sort_key(path: Path) -> tuple:
@@ -88,7 +123,11 @@ def collate_tfr_genomic(
 ) -> tuple[torch.Tensor, dict[int, torch.Tensor]]:
     """Collate samples yielded by :class:`BaskervilleTFRecordDataset`."""
     sequences = torch.stack([item[0] for item in batch], dim=0)
-    targets = {128: torch.stack([item[1][128] for item in batch], dim=0)}
+    first_targets = batch[0][1]
+    targets = {
+        resolution: torch.stack([item[1][resolution] for item in batch], dim=0)
+        for resolution in first_targets
+    }
     return sequences, targets
 
 
@@ -103,9 +142,13 @@ def collate_tfr_multimodal(
     first_targets = batch[0][1]
     targets = {
         modality: {
-            128: torch.stack([item[1][modality][128] for item in batch], dim=0)
+            resolution: torch.stack(
+                [item[1][modality][resolution] for item in batch],
+                dim=0,
+            )
+            for resolution in modality_targets
         }
-        for modality in first_targets
+        for modality, modality_targets in first_targets.items()
     }
     if len(batch[0]) == 3:
         augmentation = {
@@ -146,10 +189,15 @@ class BaskervilleTFRecordDataset(IterableDataset):
         world_size: int = 1,
         augment_rc: bool = False,
         augment_shift: int = 0,
+        target_resolution: _TargetResolution = 128,
     ):
         super().__init__()
         if pooling not in ("mean", "sum"):
             raise ValueError(f"pooling must be 'mean' or 'sum', got {pooling!r}")
+        if target_resolution not in (32, 128):
+            raise ValueError(
+                f"target_resolution must be 32 or 128, got {target_resolution}"
+            )
         if augment_shift < 0:
             raise ValueError(f"augment_shift must be >= 0, got {augment_shift}")
         if rank < 0:
@@ -171,9 +219,11 @@ class BaskervilleTFRecordDataset(IterableDataset):
         self.world_size = world_size
         self.augment_rc = augment_rc
         self.augment_shift = augment_shift
+        self.target_resolution = target_resolution
         self._augmentation_iteration = 0
 
         self.metadata = self._load_metadata(self.data_dir)
+        self.metadata._validate_resolution(target_resolution)
         self.files = self._get_tfrecord_files(self.data_dir, split)
         indices, target_rows = self._modality_indices(self.data_dir, modality)
         self.target_indices = np.asarray(indices, dtype=np.int64)
@@ -204,6 +254,14 @@ class BaskervilleTFRecordDataset(IterableDataset):
     @property
     def output_length_128bp(self) -> int:
         return self.metadata.output_length_128bp
+
+    @property
+    def prediction_crop_bins(self) -> int:
+        return self.metadata.prediction_crop_bins(self.target_resolution)
+
+    @property
+    def output_length(self) -> int:
+        return self.metadata.output_length(self.target_resolution)
 
     @staticmethod
     def _load_metadata(data_dir: Path) -> _TFRecordDatasetMetadata:
@@ -326,18 +384,32 @@ class BaskervilleTFRecordDataset(IterableDataset):
             )
         return target.reshape(self.metadata.target_length, self.metadata.num_targets)
 
-    def _pool_target_128bp(self, target: np.ndarray) -> np.ndarray:
-        if target.shape[0] % 4 != 0:
+    def _pool_target_to_resolution(
+        self,
+        target: np.ndarray,
+        resolution: int,
+    ) -> np.ndarray:
+        factor = self.metadata._factor_to_resolution(resolution)
+        if factor == 1:
+            return target.astype(np.float32, copy=False)
+        if target.shape[0] % factor != 0:
             raise ValueError(
-                f"Target length {target.shape[0]} is not divisible by 4; "
-                "cannot pool 32 bp targets to 128 bp."
+                f"Target length {target.shape[0]} is not divisible by {factor}; "
+                f"cannot pool {self.metadata.pool_width} bp targets to "
+                f"{resolution} bp."
             )
-        reshaped = target.reshape(target.shape[0] // 4, 4, target.shape[1])
+        reshaped = target.reshape(target.shape[0] // factor, factor, target.shape[1])
         if self.pooling == "mean":
             return reshaped.mean(axis=1)
         if self.pooling == "sum":
             return reshaped.sum(axis=1)
         raise ValueError(f"Unknown pooling={self.pooling!r}; expected 'mean' or 'sum'.")
+
+    def _pool_target_128bp(self, target: np.ndarray) -> np.ndarray:
+        return self._pool_target_to_resolution(target, 128)
+
+    def _target_for_resolution(self, target: np.ndarray) -> np.ndarray:
+        return self._pool_target_to_resolution(target, self.target_resolution)
 
     @staticmethod
     def _reverse_complement_sequence(sequence: np.ndarray) -> np.ndarray:
@@ -492,18 +564,18 @@ class BaskervilleTFRecordDataset(IterableDataset):
                 )
                 sequence, augmentation = self._augment_sequence(sequence, rng)
                 target = self._decode_target(parsed["target"].numpy())
-                target_128bp = self._pool_target_128bp(target)
+                target = self._target_for_resolution(target)
 
                 if self.augment_rc or self.augment_shift:
                     yield (
                         torch.from_numpy(sequence).float(),
-                        {128: torch.from_numpy(target_128bp).float()},
+                        {self.target_resolution: torch.from_numpy(target).float()},
                         augmentation,
                     )
                 else:
                     yield (
                         torch.from_numpy(sequence).float(),
-                        {128: torch.from_numpy(target_128bp).float()},
+                        {self.target_resolution: torch.from_numpy(target).float()},
                     )
 
             if not self.repeat:
@@ -528,6 +600,7 @@ class BaskervilleMultiTFRecordDataset(BaskervilleTFRecordDataset):
         world_size: int = 1,
         augment_rc: bool = False,
         augment_shift: int = 0,
+        target_resolution: _TargetResolution = 128,
     ):
         if modalities is None:
             modalities = self.available_modalities(data_dir)
@@ -548,6 +621,7 @@ class BaskervilleMultiTFRecordDataset(BaskervilleTFRecordDataset):
             world_size=world_size,
             augment_rc=augment_rc,
             augment_shift=augment_shift,
+            target_resolution=target_resolution,
         )
 
         self.target_indices_by_modality: dict[str, np.ndarray] = {}
@@ -599,9 +673,9 @@ class BaskervilleMultiTFRecordDataset(BaskervilleTFRecordDataset):
                 modality_targets = {}
                 for modality, indices in self.target_indices_by_modality.items():
                     target = full_target[:, indices].astype(np.float32, copy=False)
-                    target_128bp = self._pool_target_128bp(target)
+                    target = self._target_for_resolution(target)
                     modality_targets[modality] = {
-                        128: torch.from_numpy(target_128bp).float()
+                        self.target_resolution: torch.from_numpy(target).float()
                     }
 
                 if self.augment_rc or self.augment_shift:
