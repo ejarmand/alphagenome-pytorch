@@ -188,6 +188,7 @@ class AlphaGenome(nn.Module):
         """Initialize AlphaGenome model."""
         super().__init__()
         self.num_organisms = num_organisms
+        self._embeddings_128bp_only = False
         track_means_dict = track_means_dict or {}
 
         # Set dtype policy (default: full float32, works everywhere)
@@ -403,6 +404,62 @@ class AlphaGenome(nn.Module):
 
         return model
 
+    @classmethod
+    def from_pretrained_128bp_encoder(
+        cls,
+        path: Union[str, Path],
+        dtype_policy: Optional[DtypePolicy] = None,
+        device: Optional[Union[str, torch.device]] = None,
+        **kwargs,
+    ) -> "AlphaGenome":
+        """Load only the modules needed by ``encode(..., resolutions=(128,))``."""
+        if dtype_policy is None:
+            dtype_policy = DtypePolicy.default()
+
+        model = cls(dtype_policy=dtype_policy, **kwargs)
+        model._embeddings_128bp_only = True
+        model.decoder = None
+        model.embedder_1bp = None
+        model.embedder_pair = None
+        model.heads = nn.ModuleDict()
+        model.contact_maps_head = None
+        model.splice_sites_classification_head = None
+        model.splice_sites_usage_head = None
+        model.splice_sites_junction_head = None
+        if device:
+            model.to(device)
+
+        prefixes = ("encoder.", "organism_embed.", "tower.", "embedder_128bp.")
+        map_location = device if device else "cpu"
+        if Path(path).suffix == ".safetensors":
+            from safetensors import safe_open
+
+            state_dict = {}
+            with safe_open(path, framework="pt", device=str(map_location)) as weights:
+                for key in weights.keys():
+                    if key.startswith(prefixes):
+                        state_dict[key] = weights.get_tensor(key)
+        else:
+            state_dict = {
+                key: tensor
+                for key, tensor in torch.load(path, map_location=map_location, weights_only=True).items()
+                if key.startswith(prefixes)
+            }
+
+        result = model.load_state_dict(state_dict, strict=False)
+        if result.unexpected_keys:
+            raise RuntimeError(
+                f"Unexpected keys in 128bp encoder state_dict: {result.unexpected_keys}. "
+                "This may indicate a version mismatch between the weights file and the model architecture."
+            )
+        if result.missing_keys:
+            raise RuntimeError(
+                f"Missing keys in 128bp encoder state_dict: {result.missing_keys}. "
+                "This may indicate a version mismatch between the weights file and the model architecture."
+            )
+
+        return model
+
     def set_track_metadata_catalog(self, catalog: TrackMetadataCatalog) -> None:
         """Attach a metadata catalog used by named output views."""
         self._track_metadata_catalog = catalog
@@ -530,6 +587,9 @@ class AlphaGenome(nn.Module):
         # Cast input to compute dtype
         dna_sequence = self.dtype_policy.cast_to_compute(dna_sequence)
 
+        if self._embeddings_128bp_only and resolutions is not None and 1 in resolutions:
+            raise ValueError("This AlphaGenome instance was loaded for 128bp embeddings only.")
+
         # ===== ENCODER (NCL) =====
         trunk, intermediates = self.encoder(dna_sequence)  # trunk: (B, 1536, 1024)
 
@@ -555,6 +615,10 @@ class AlphaGenome(nn.Module):
         embeddings_128bp = self.embedder_128bp(
             trunk_ncl, organism_index, channels_last=False
         )  # (B, 3072, 1024)
+
+        if self._embeddings_128bp_only:
+            del intermediates
+            return None, embeddings_128bp, None, False
 
         # 1bp Embeddings (from decoder + skip) - skip if not needed
         if need_1bp:
@@ -634,7 +698,8 @@ class AlphaGenome(nn.Module):
                 outputs['embeddings_1bp'] = embeddings_1bp
             outputs['embeddings_128bp'] = embeddings_128bp
 
-        outputs['embeddings_pair'] = embeddings_pair
+        if embeddings_pair is not None:
+            outputs['embeddings_pair'] = embeddings_pair
 
         return self._cast_outputs(outputs)
 
