@@ -23,10 +23,16 @@ from alphagenome_pytorch.utils.sequence import (
     shift_onehot,
 )
 from scripts.finetune_tfr_heads import (
+    CachedEmbeddingTFRecordDataset,
+    ENCODER_SKIP_32BP_KEY,
+    ENCODER_SKIP_64BP_KEY,
     TFRHeads,
+    collate_tfr_cached_embeddings,
     compute_loss,
     compute_regression_metrics,
     cell_types_from_target_rows,
+    embedding_cache_manifest_path,
+    forward_heads,
     new_metric_stats,
     switch_reverse_predictions,
     update_metric_stats,
@@ -200,7 +206,11 @@ def test_tfr_heads_32bp_unet_upsamples_fourfold():
         cell_embedding_dim=2,
         target_resolution=32,
     )
-    embeddings = {128: torch.randn(2, 4, 3)}
+    embeddings = {
+        128: torch.randn(2, 4, 3),
+        ENCODER_SKIP_64BP_KEY: torch.randn(2, 1536, 6),
+        ENCODER_SKIP_32BP_KEY: torch.randn(2, 1408, 12),
+    }
     organism_idx = torch.zeros(2, dtype=torch.long)
 
     outputs = model(embeddings, organism_idx, return_scaled=True)
@@ -479,6 +489,118 @@ def test_collate_tfr_multimodal():
     assert targets["RNA"][128].shape == (2, 2, 1)
     torch.testing.assert_close(targets["ATAC"][128][1], atac1)
     torch.testing.assert_close(targets["RNA"][128][1], rna1)
+
+
+@pytest.mark.parametrize("target_resolution,target_shape", [(128, (2, 2)), (32, (8, 2))])
+def test_cached_embedding_dataset_selects_reverse_embedding_with_rc_flag(
+    tmp_path,
+    target_resolution,
+    target_shape,
+):
+    data_dir = _write_minimal_dataset(tmp_path)
+    source_dataset = BaskervilleMultiTFRecordDataset(
+        data_dir,
+        modalities=["ATAC"],
+        target_resolution=target_resolution,
+    )
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    chunk_name = "train.rank00000.chunk000000.pt"
+    torch.save(
+        {
+            "embeddings_forward_128bp": torch.ones(1, 4, 2),
+            "embeddings_reverse_128bp": torch.full((1, 4, 2), 2.0),
+            "encoder_skip_forward_64bp": torch.full((1, 1536, 4), 4.0),
+            "encoder_skip_reverse_64bp": torch.full((1, 1536, 4), 5.0),
+            "encoder_skip_forward_32bp": torch.full((1, 1408, 8), 6.0),
+            "encoder_skip_reverse_32bp": torch.full((1, 1408, 8), 7.0),
+            "targets": {
+                "ATAC": {
+                    target_resolution: torch.full((1, *target_shape), 3.0)
+                }
+            },
+        },
+        cache_dir / chunk_name,
+    )
+    embedding_cache_manifest_path(cache_dir, "train", 0, 1).write_text(
+        json.dumps({"chunks": [{"path": chunk_name, "num_examples": 1}]})
+    )
+
+    dataset = CachedEmbeddingTFRecordDataset(
+        cache_dir,
+        split="train",
+        source_dataset=source_dataset,
+        augment_rc=True,
+        seed=0,
+    )
+
+    embeddings, targets, augmentation = next(iter(dataset))
+
+    assert augmentation["reverse_complement"] is True
+    assert dataset.target_resolution == target_resolution
+    torch.testing.assert_close(embeddings[128], torch.full((4, 2), 2.0))
+    torch.testing.assert_close(
+        embeddings[ENCODER_SKIP_64BP_KEY],
+        torch.full((1536, 4), 5.0),
+    )
+    torch.testing.assert_close(
+        embeddings[ENCODER_SKIP_32BP_KEY],
+        torch.full((1408, 8), 7.0),
+    )
+    torch.testing.assert_close(
+        targets["ATAC"][target_resolution],
+        torch.full(target_shape, 3.0),
+    )
+
+
+def test_collate_tfr_cached_embeddings_with_augmentation():
+    batch = [
+        (
+            {128: torch.ones(4, 2)},
+            {"ATAC": {32: torch.ones(8, 2)}},
+            {"reverse_complement": True, "shift": 0},
+        ),
+        (
+            {128: torch.full((4, 2), 2.0)},
+            {"ATAC": {32: torch.full((8, 2), 3.0)}},
+            {"reverse_complement": False, "shift": 0},
+        ),
+    ]
+
+    embeddings, targets, augmentation = collate_tfr_cached_embeddings(batch)
+
+    assert embeddings[128].shape == (2, 4, 2)
+    assert targets["ATAC"][32].shape == (2, 8, 2)
+    assert augmentation["reverse_complement"].tolist() == [True, False]
+
+
+def test_forward_heads_uses_cached_embeddings_without_model_forward():
+    class FailingModel(torch.nn.Module):
+        def forward(self, *args, **kwargs):
+            raise AssertionError("model forward should not run for cached embeddings")
+
+    class EchoHeads(torch.nn.Module):
+        def forward(self, embeddings, organism_idx, *, return_scaled):
+            del organism_idx, return_scaled
+            return {"ATAC": embeddings[128].transpose(1, 2)}
+
+    embeddings = {128: torch.arange(6, dtype=torch.float32).reshape(1, 2, 3)}
+    organism_idx = torch.zeros(1, dtype=torch.long)
+
+    predictions, metric_predictions = forward_heads(
+        FailingModel(),
+        EchoHeads(),
+        embeddings,
+        organism_idx,
+        crop_bins=0,
+        use_amp=False,
+        return_scaled=False,
+        requires_grad=True,
+    )
+
+    expected = embeddings[128].transpose(1, 2)
+    torch.testing.assert_close(predictions["ATAC"], expected)
+    torch.testing.assert_close(metric_predictions["ATAC"], expected)
 
 
 def test_poisson_multinomial_loss_alias_runs():

@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
+import random
 import re
 from contextlib import nullcontext
 from datetime import datetime
@@ -18,7 +20,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 from tqdm import tqdm
 
 from alphagenome_pytorch import AlphaGenome
@@ -33,10 +35,13 @@ from alphagenome_pytorch.extensions.finetuning.training import create_lr_schedul
 from alphagenome_pytorch.extensions.finetuning.transfer import load_trunk, remove_all_heads
 from alphagenome_pytorch.heads import EMBEDDING_128BP_DIM
 from alphagenome_pytorch.losses import multinomial_loss
+from alphagenome_pytorch.utils.sequence import reverse_complement_onehot_tensor
 
 
 DEFAULT_HF_MODEL_ID = "gtca/alphagenome_pytorch"
 DEFAULT_HF_FILENAME = "model_fold_1.safetensors"
+ENCODER_SKIP_32BP_KEY = "encoder_skip_32bp"
+ENCODER_SKIP_64BP_KEY = "encoder_skip_64bp"
 
 
 def parse_args() -> argparse.Namespace:
@@ -198,6 +203,41 @@ def parse_args() -> argparse.Namespace:
             "during training. Targets are left unchanged."
         ),
     )
+    parser.add_argument(
+        "--precompute-embeddings",
+        action="store_true",
+        help=(
+            "Precompute/cache original and reverse-complement frozen trunk "
+            "embeddings for train/valid TFRecords, then train heads from the "
+            "cached embeddings instead of forwarding the trunk each step."
+        ),
+    )
+    parser.add_argument(
+        "--embedding-cache-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory for cached embedding chunks. Defaults to a settings-keyed "
+            "subdirectory under --output-dir/embedding_cache."
+        ),
+    )
+    parser.add_argument(
+        "--refresh-embedding-cache",
+        action="store_true",
+        help="Recompute cached embeddings even when matching cache manifests exist.",
+    )
+    parser.add_argument(
+        "--embedding-cache-dtype",
+        choices=["float32", "float16", "bfloat16"],
+        default="bfloat16",
+        help="Dtype used when storing cached 128 bp embeddings.",
+    )
+    parser.add_argument(
+        "--embedding-cache-chunk-size",
+        type=int,
+        default=16,
+        help="Number of examples per cached embedding chunk file.",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("finetuning_output/tfr_heads"))
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--device", default="auto", help="'auto', 'cpu', 'cuda', or e.g. 'cuda:0'")
@@ -271,8 +311,226 @@ def create_loader(
     )
 
 
+def collate_tfr_cached_embeddings(
+    batch: list[
+        tuple[dict[int | str, torch.Tensor], dict[str, dict[int, torch.Tensor]]]
+        | tuple[
+            dict[int | str, torch.Tensor],
+            dict[str, dict[int, torch.Tensor]],
+            dict[str, bool | int],
+        ]
+    ],
+) -> (
+    tuple[dict[int | str, torch.Tensor], dict[str, dict[int, torch.Tensor]]]
+    | tuple[
+        dict[int | str, torch.Tensor],
+        dict[str, dict[int, torch.Tensor]],
+        dict[str, torch.Tensor],
+    ]
+):
+    first_embeddings = batch[0][0]
+    embeddings = {
+        key: torch.stack([item[0][key] for item in batch], dim=0)
+        for key in first_embeddings
+    }
+    first_targets = batch[0][1]
+    targets = {
+        modality: {
+            resolution: torch.stack(
+                [item[1][modality][resolution] for item in batch],
+                dim=0,
+            )
+            for resolution in modality_targets
+        }
+        for modality, modality_targets in first_targets.items()
+    }
+    if len(batch[0]) == 3:
+        augmentation = {
+            "reverse_complement": torch.tensor(
+                [bool(item[2]["reverse_complement"]) for item in batch],
+                dtype=torch.bool,
+            ),
+            "shift": torch.tensor(
+                [int(item[2]["shift"]) for item in batch],
+                dtype=torch.long,
+            ),
+        }
+        return embeddings, targets, augmentation
+    return embeddings, targets
+
+
+class CachedEmbeddingTFRecordDataset(IterableDataset):
+    """Iterable dataset backed by precomputed original/RC trunk embeddings."""
+
+    def __init__(
+        self,
+        cache_dir: Path,
+        *,
+        split: str,
+        source_dataset: BaskervilleMultiTFRecordDataset,
+        rank: int = 0,
+        world_size: int = 1,
+        augment_rc: bool = False,
+        shuffle_files: bool = False,
+        seed: int = 0,
+    ):
+        super().__init__()
+        self.cache_dir = Path(cache_dir)
+        self.split = split
+        self.rank = rank
+        self.world_size = world_size
+        self.augment_rc = augment_rc
+        self.shuffle_files = shuffle_files
+        self.seed = seed
+        self.target_resolution = source_dataset.target_resolution
+        self._iteration = 0
+
+        self.metadata = source_dataset.metadata
+        self.modalities = list(source_dataset.modalities)
+        self.target_indices_by_modality = source_dataset.target_indices_by_modality
+        self.target_rows_by_modality = source_dataset.target_rows_by_modality
+        self.strand_pair_by_modality = source_dataset.strand_pair_by_modality
+        self.assay_type_by_modality = source_dataset.assay_type_by_modality
+        self._global_length = len(source_dataset)
+
+        self.manifest_path = embedding_cache_manifest_path(
+            self.cache_dir,
+            split,
+            rank,
+            world_size,
+        )
+        if not self.manifest_path.exists():
+            raise FileNotFoundError(
+                f"Cached embedding manifest not found: {self.manifest_path}"
+            )
+        self.manifest = json.loads(self.manifest_path.read_text())
+        self.chunk_files = [
+            self.cache_dir / chunk["path"]
+            for chunk in self.manifest.get("chunks", [])
+        ]
+        missing = [path for path in self.chunk_files if not path.exists()]
+        if missing:
+            raise FileNotFoundError(
+                "Cached embedding chunks are missing: "
+                + ", ".join(str(path) for path in missing[:3])
+            )
+
+    def __len__(self) -> int:
+        return self._global_length
+
+    @property
+    def prediction_crop_128bp(self) -> int:
+        return self.metadata.prediction_crop_128bp
+
+    @property
+    def output_length_128bp(self) -> int:
+        return self.metadata.output_length_128bp
+
+    @property
+    def prediction_crop_bins(self) -> int:
+        return self.metadata.prediction_crop_bins(self.target_resolution)
+
+    @property
+    def output_length(self) -> int:
+        return self.metadata.output_length(self.target_resolution)
+
+    def _next_iteration(self) -> int:
+        iteration = self._iteration
+        self._iteration += 1
+        return iteration
+
+    def _rng(self, iteration: int) -> random.Random:
+        worker = get_worker_info()
+        worker_id = worker.id if worker is not None else 0
+        return random.Random(
+            self.seed
+            + self.rank * 1009
+            + worker_id * 9176
+            + iteration * 104729
+        )
+
+    def _worker_chunk_files(self, iteration: int) -> list[Path]:
+        files = list(self.chunk_files)
+        worker = get_worker_info()
+        if worker is not None:
+            files = files[worker.id::worker.num_workers]
+        if self.shuffle_files:
+            rng = self._rng(iteration)
+            rng.shuffle(files)
+        return files
+
+    def __iter__(self):
+        iteration = self._next_iteration()
+        rng = self._rng(iteration)
+        target_resolution = self.target_resolution
+        for chunk_path in self._worker_chunk_files(iteration):
+            chunk = torch.load(chunk_path, map_location="cpu")
+            embeddings_forward = chunk["embeddings_forward_128bp"]
+            embeddings_reverse = chunk["embeddings_reverse_128bp"]
+            skip_64_forward = chunk.get("encoder_skip_forward_64bp")
+            skip_64_reverse = chunk.get("encoder_skip_reverse_64bp")
+            skip_32_forward = chunk.get("encoder_skip_forward_32bp")
+            skip_32_reverse = chunk.get("encoder_skip_reverse_32bp")
+            targets_by_modality = chunk["targets"]
+            for sample_idx in range(embeddings_forward.shape[0]):
+                reverse_complement = self.augment_rc and rng.random() > 0.5
+                embeddings = {
+                    128: (
+                        embeddings_reverse[sample_idx]
+                        if reverse_complement
+                        else embeddings_forward[sample_idx]
+                    )
+                }
+                if skip_64_forward is not None and skip_64_reverse is not None:
+                    embeddings[ENCODER_SKIP_64BP_KEY] = (
+                        skip_64_reverse[sample_idx]
+                        if reverse_complement
+                        else skip_64_forward[sample_idx]
+                    )
+                if skip_32_forward is not None and skip_32_reverse is not None:
+                    embeddings[ENCODER_SKIP_32BP_KEY] = (
+                        skip_32_reverse[sample_idx]
+                        if reverse_complement
+                        else skip_32_forward[sample_idx]
+                    )
+                targets = {
+                    modality: {target_resolution: targets[target_resolution][sample_idx]}
+                    for modality, targets in targets_by_modality.items()
+                }
+                if self.augment_rc:
+                    yield (
+                        embeddings,
+                        targets,
+                        {"reverse_complement": reverse_complement, "shift": 0},
+                    )
+                else:
+                    yield embeddings, targets
+
+
+def create_cached_embedding_loader(
+    dataset: CachedEmbeddingTFRecordDataset,
+    batch_size: int,
+    num_workers: int,
+    *,
+    prefetch_n: int = 1,
+    persistent_workers: bool = False,
+) -> DataLoader:
+    if prefetch_n < 1:
+        raise ValueError(f"prefetch_n must be >= 1, got {prefetch_n}")
+    effective_workers = min(num_workers, len(dataset.chunk_files)) if num_workers > 0 else 0
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=effective_workers,
+        collate_fn=collate_tfr_cached_embeddings,
+        pin_memory=torch.cuda.is_available(),
+        prefetch_factor=prefetch_n if effective_workers > 0 else None,
+        persistent_workers=persistent_workers and effective_workers > 0,
+    )
+
+
 def estimate_local_batches(
-    dataset: BaskervilleMultiTFRecordDataset,
+    dataset: BaskervilleMultiTFRecordDataset | CachedEmbeddingTFRecordDataset,
     batch_size: int,
     max_steps: int | None,
 ) -> int:
@@ -283,7 +541,7 @@ def estimate_local_batches(
 
 
 def estimate_total_optimizer_steps(
-    dataset: BaskervilleMultiTFRecordDataset,
+    dataset: BaskervilleMultiTFRecordDataset | CachedEmbeddingTFRecordDataset,
     batch_size: int,
     epochs: int,
     accumulation_steps: int,
@@ -398,7 +656,7 @@ class ModalityDecoder(nn.Module):
         super().__init__()
         self.target_resolution = target_resolution
         if target_resolution == 32:
-            self.upscaler = UNet32bpUpsampler(embedding_dim)
+            self.upscaler = EncoderSkip32bpUpsampler(embedding_dim)
         elif target_resolution == 128:
             self.upscaler = nn.Identity()
         else:
@@ -416,8 +674,18 @@ class ModalityDecoder(nn.Module):
                 nn.init.trunc_normal_(layer.weight, std=stdv)
                 nn.init.zeros_(layer.bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.layers(self.upscaler(x))
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        encoder_skips: dict[str, torch.Tensor] | None = None,
+        n_cells: int = 1,
+    ) -> torch.Tensor:
+        if self.target_resolution == 32:
+            x = self.upscaler(x, encoder_skips=encoder_skips, n_cells=n_cells)
+        else:
+            x = self.upscaler(x)
+        return self.layers(x)
 
 
 class ConvNormGelu(nn.Module):
@@ -440,31 +708,47 @@ class ConvNormGelu(nn.Module):
         return self.conv(F.gelu(self.norm(x)))
 
 
-class UNet32bpUpsampler(nn.Module):
-    """Upscale 128 bp cell embeddings to 32 bp bins with a compact 1D U-Net."""
+class EncoderSkip32bpUpsampler(nn.Module):
+    """Upscale 128 bp cell embeddings to 32 bp bins using encoder skip features."""
 
     def __init__(self, channels: int):
         super().__init__()
         self.stem = ConvNormGelu(channels)
-        self.down = ConvNormGelu(channels)
-        self.bottleneck = ConvNormGelu(channels)
-        self.low_refine = ConvNormGelu(channels)
+        self.skip_64bp = nn.Conv1d(1536, channels, kernel_size=1)
+        self.skip_32bp = nn.Conv1d(1408, channels, kernel_size=1)
         self.up_refine_64bp = ConvNormGelu(channels)
         self.up_refine_32bp = ConvNormGelu(channels)
+        for layer in (self.skip_64bp, self.skip_32bp):
+            stdv = 1.0 / math.sqrt(layer.in_channels)
+            nn.init.trunc_normal_(layer.weight, std=stdv)
+            nn.init.zeros_(layer.bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        skip_128bp = x + self.stem(x)
-        low = F.avg_pool1d(skip_128bp, kernel_size=2, stride=2, ceil_mode=True)
-        low = low + self.down(low)
-        low = low + self.bottleneck(low)
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        encoder_skips: dict[str, torch.Tensor] | None,
+        n_cells: int,
+    ) -> torch.Tensor:
+        if encoder_skips is None:
+            raise KeyError("32 bp upsampling requires cached/runtime encoder skip features")
+        skip_64bp = encoder_skips.get(ENCODER_SKIP_64BP_KEY)
+        skip_32bp = encoder_skips.get(ENCODER_SKIP_32BP_KEY)
+        if skip_64bp is None or skip_32bp is None:
+            raise KeyError(
+                "32 bp upsampling requires encoder_skip_64bp and encoder_skip_32bp"
+            )
 
-        up_128bp = F.interpolate(low, size=skip_128bp.shape[-1], mode="nearest")
-        up_128bp = skip_128bp + self.low_refine(up_128bp)
+        x_128bp = x + self.stem(x)
 
-        up_64bp = F.interpolate(up_128bp, scale_factor=2, mode="nearest")
+        projected_64bp = self.skip_64bp(skip_64bp).repeat_interleave(n_cells, dim=0)
+        up_64bp = F.interpolate(x_128bp, size=projected_64bp.shape[-1], mode="nearest")
+        up_64bp = up_64bp + projected_64bp
         up_64bp = up_64bp + self.up_refine_64bp(up_64bp)
 
-        up_32bp = F.interpolate(up_64bp, scale_factor=2, mode="nearest")
+        projected_32bp = self.skip_32bp(skip_32bp).repeat_interleave(n_cells, dim=0)
+        up_32bp = F.interpolate(up_64bp, size=projected_32bp.shape[-1], mode="nearest")
+        up_32bp = up_32bp + projected_32bp
         return up_32bp + self.up_refine_32bp(up_32bp)
 
 
@@ -536,7 +820,7 @@ class TFRHeads(nn.Module):
     def _forward_cell_modality_head(
         self,
         modality: str,
-        embeddings: dict[int, torch.Tensor],
+        embeddings: dict[int | str, torch.Tensor],
         organism_idx: torch.Tensor,
         *,
         return_scaled: bool,
@@ -572,8 +856,16 @@ class TFRHeads(nn.Module):
         )
         cell_embeddings = cell_embeddings + cell_biases.to(dtype=emb.dtype)[None, :, :, None]
         batch_size, n_cells, cell_dim, seq_len = cell_embeddings.shape
+        encoder_skips = None
+        if self.target_resolution == 32:
+            encoder_skips = {
+                ENCODER_SKIP_64BP_KEY: embeddings[ENCODER_SKIP_64BP_KEY],
+                ENCODER_SKIP_32BP_KEY: embeddings[ENCODER_SKIP_32BP_KEY],
+            }
         pred_by_cell = modality_layer(
-            cell_embeddings.reshape(batch_size * n_cells, cell_dim, seq_len)
+            cell_embeddings.reshape(batch_size * n_cells, cell_dim, seq_len),
+            encoder_skips=encoder_skips,
+            n_cells=n_cells,
         )
         output_len = pred_by_cell.shape[-1]
         pred_by_cell = pred_by_cell.reshape(batch_size, n_cells, output_len)
@@ -595,7 +887,7 @@ class TFRHeads(nn.Module):
 
     def forward(
         self,
-        embeddings: dict[int, torch.Tensor],
+        embeddings: dict[int | str, torch.Tensor],
         organism_idx: torch.Tensor,
         *,
         return_scaled: bool,
@@ -684,6 +976,326 @@ def broadcast_object(obj: Any, src: int = 0) -> Any:
     return objects[0]
 
 
+def embedding_cache_manifest_path(
+    cache_dir: Path,
+    split: str,
+    rank: int,
+    world_size: int,
+) -> Path:
+    return cache_dir / f"{split}.rank{rank:05d}-of{world_size:05d}.json"
+
+
+def resolve_embedding_cache_dir(
+    args: argparse.Namespace,
+    modalities: list[str],
+    world_size: int,
+) -> Path:
+    if args.embedding_cache_dir is not None:
+        return args.embedding_cache_dir
+    key_payload = {
+        "data_dir": str(args.data_dir.resolve()),
+        "pretrained_weights": (
+            str(args.pretrained_weights.resolve())
+            if args.pretrained_weights is not None
+            else None
+        ),
+        "modalities": modalities,
+        "pooling": args.pooling,
+        "target_resolution": args.target_resolution,
+        "dtype": args.dtype,
+        "cache_dtype": args.embedding_cache_dtype,
+        "world_size": world_size,
+    }
+    cache_key = hashlib.sha1(
+        json.dumps(key_payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:12]
+    return args.output_dir / "embedding_cache" / cache_key
+
+
+def embedding_cache_expected_metadata(
+    args: argparse.Namespace,
+    dataset: BaskervilleMultiTFRecordDataset,
+    split: str,
+    rank: int,
+    world_size: int,
+) -> dict[str, Any]:
+    return {
+        "format_version": 1,
+        "split": split,
+        "rank": rank,
+        "world_size": world_size,
+        "data_dir": str(args.data_dir.resolve()),
+        "pretrained_weights": (
+            str(args.pretrained_weights.resolve())
+            if args.pretrained_weights is not None
+            else None
+        ),
+        "modalities": list(dataset.modalities),
+        "pooling": args.pooling,
+        "target_resolution": args.target_resolution,
+        "encoder_skips": args.target_resolution == 32,
+        "model_dtype": args.dtype,
+        "embedding_cache_dtype": args.embedding_cache_dtype,
+        "seq_length": dataset.metadata.seq_length,
+        "target_length": dataset.metadata.target_length,
+        "output_length": dataset.output_length,
+        "crop_bins": dataset.prediction_crop_bins,
+        "output_length_128bp": dataset.output_length_128bp,
+        "crop_bins_128bp": dataset.prediction_crop_128bp,
+    }
+
+
+def embedding_cache_ready(
+    manifest_path: Path,
+    expected_metadata: dict[str, Any],
+    *,
+    refresh: bool,
+) -> bool:
+    if refresh or not manifest_path.exists():
+        return False
+    manifest = json.loads(manifest_path.read_text())
+    manifest_metadata = {
+        key: manifest.get(key)
+        for key in expected_metadata
+    }
+    if manifest_metadata != expected_metadata:
+        raise ValueError(
+            f"Embedding cache manifest {manifest_path} does not match the "
+            "requested data/model settings. Use --refresh-embedding-cache or "
+            "choose a different --embedding-cache-dir."
+        )
+    chunks = manifest.get("chunks", [])
+    return bool(chunks) and all(
+        (manifest_path.parent / chunk["path"]).exists()
+        for chunk in chunks
+    )
+
+
+def cache_storage_dtype(name: str) -> torch.dtype:
+    if name == "float32":
+        return torch.float32
+    if name == "float16":
+        return torch.float16
+    if name == "bfloat16":
+        return torch.bfloat16
+    raise ValueError(f"Unsupported embedding cache dtype: {name}")
+
+
+@torch.no_grad()
+def compute_embedding_inputs(
+    model: torch.nn.Module,
+    sequences: torch.Tensor,
+    organism_idx: torch.Tensor,
+    *,
+    use_amp: bool,
+    include_encoder_skips: bool,
+) -> dict[int | str, torch.Tensor]:
+    amp_context = autocast_context(sequences.device, use_amp)
+    with amp_context:
+        if include_encoder_skips:
+            sequences = model.dtype_policy.cast_to_compute(sequences)
+            trunk, intermediates = model.encoder(sequences)
+            skip_64bp = intermediates["bin_size_64"].detach()
+            skip_32bp = intermediates["bin_size_32"].detach()
+            trunk = trunk.transpose(1, 2)
+            organism_embedding = model.organism_embed(organism_idx).unsqueeze(1)
+            trunk = trunk + organism_embedding
+            trunk, _pair_activations = model.tower(
+                trunk,
+                compute_dtype=model.dtype_policy.compute_dtype,
+            )
+            trunk_ncl = trunk.transpose(1, 2)
+            embeddings_128bp = model.embedder_128bp(
+                trunk_ncl,
+                organism_idx,
+                channels_last=False,
+            )
+            return {
+                128: embeddings_128bp.detach(),
+                ENCODER_SKIP_64BP_KEY: skip_64bp,
+                ENCODER_SKIP_32BP_KEY: skip_32bp,
+            }
+        outputs = model(
+            sequences,
+            organism_idx,
+            return_embeddings=True,
+            resolutions=(128,),
+            channels_last=False,
+            embeddings_only=True,
+        )
+    return {128: outputs["embeddings_128bp"].detach()}
+
+
+@torch.no_grad()
+def precompute_embedding_cache(
+    model: torch.nn.Module,
+    dataset: BaskervilleMultiTFRecordDataset,
+    args: argparse.Namespace,
+    *,
+    split: str,
+    cache_dir: Path,
+    device: torch.device,
+    rank: int,
+    world_size: int,
+    num_workers: int,
+) -> None:
+    if args.embedding_cache_chunk_size < 1:
+        raise ValueError(
+            f"--embedding-cache-chunk-size must be >= 1, got "
+            f"{args.embedding_cache_chunk_size}"
+        )
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = embedding_cache_manifest_path(cache_dir, split, rank, world_size)
+    expected_metadata = embedding_cache_expected_metadata(
+        args,
+        dataset,
+        split,
+        rank,
+        world_size,
+    )
+    if embedding_cache_ready(
+        manifest_path,
+        expected_metadata,
+        refresh=args.refresh_embedding_cache,
+    ):
+        print_rank0(
+            f"Using existing {split} embedding cache at {manifest_path}",
+            rank,
+        )
+        return
+
+    loader = create_loader(
+        dataset,
+        args.batch_size,
+        num_workers,
+        prefetch_n=args.prefetch_n,
+        persistent_workers=False,
+    )
+    storage_dtype = cache_storage_dtype(args.embedding_cache_dtype)
+    target_resolution = args.target_resolution
+    include_encoder_skips = target_resolution == 32
+    chunks: list[dict[str, Any]] = []
+    chunk_idx = 0
+    examples_in_cache = 0
+    pending_forward: dict[int | str, list[torch.Tensor]] = {128: []}
+    pending_reverse: dict[int | str, list[torch.Tensor]] = {128: []}
+    if include_encoder_skips:
+        pending_forward[ENCODER_SKIP_64BP_KEY] = []
+        pending_forward[ENCODER_SKIP_32BP_KEY] = []
+        pending_reverse[ENCODER_SKIP_64BP_KEY] = []
+        pending_reverse[ENCODER_SKIP_32BP_KEY] = []
+    pending_targets: dict[str, list[torch.Tensor]] = {
+        modality: []
+        for modality in dataset.modalities
+    }
+
+    def flush_chunk() -> None:
+        nonlocal chunk_idx, examples_in_cache
+        if not pending_forward[128]:
+            return
+        forward_inputs = {
+            key: torch.cat(parts, dim=0)
+            for key, parts in pending_forward.items()
+        }
+        reverse_inputs = {
+            key: torch.cat(parts, dim=0)
+            for key, parts in pending_reverse.items()
+        }
+        embeddings_forward = forward_inputs[128]
+        embeddings_reverse = reverse_inputs[128]
+        targets = {
+            modality: {target_resolution: torch.cat(parts, dim=0)}
+            for modality, parts in pending_targets.items()
+        }
+        chunk_name = f"{split}.rank{rank:05d}.chunk{chunk_idx:06d}.pt"
+        chunk_payload = {
+            "embeddings_forward_128bp": embeddings_forward,
+            "embeddings_reverse_128bp": embeddings_reverse,
+            "targets": targets,
+        }
+        if include_encoder_skips:
+            chunk_payload.update({
+                "encoder_skip_forward_64bp": forward_inputs[ENCODER_SKIP_64BP_KEY],
+                "encoder_skip_reverse_64bp": reverse_inputs[ENCODER_SKIP_64BP_KEY],
+                "encoder_skip_forward_32bp": forward_inputs[ENCODER_SKIP_32BP_KEY],
+                "encoder_skip_reverse_32bp": reverse_inputs[ENCODER_SKIP_32BP_KEY],
+            })
+        torch.save(chunk_payload, cache_dir / chunk_name)
+        chunks.append({
+            "path": chunk_name,
+            "num_examples": int(embeddings_forward.shape[0]),
+            "embedding_shape": list(embeddings_forward.shape[1:]),
+            "embedding_dtype": str(embeddings_forward.dtype).replace("torch.", ""),
+            "encoder_skip_shapes": (
+                {
+                    "64bp": list(forward_inputs[ENCODER_SKIP_64BP_KEY].shape[1:]),
+                    "32bp": list(forward_inputs[ENCODER_SKIP_32BP_KEY].shape[1:]),
+                }
+                if include_encoder_skips
+                else None
+            ),
+            "target_resolution": target_resolution,
+        })
+        examples_in_cache += int(embeddings_forward.shape[0])
+        chunk_idx += 1
+        for parts in pending_forward.values():
+            parts.clear()
+        for parts in pending_reverse.values():
+            parts.clear()
+        for parts in pending_targets.values():
+            parts.clear()
+
+    pbar = tqdm(
+        desc=f"cache-{split}",
+        disable=not is_main_process(rank),
+        total=None,
+    )
+    for batch in loader:
+        sequences, modality_targets, _augmentation = unpack_tfr_batch(batch)
+        if isinstance(sequences, dict):
+            raise TypeError("Embedding precompute expects sequence TFRecord batches")
+        sequences = sequences.to(device, non_blocking=True)
+        batch_size = sequences.shape[0]
+        organism_idx = torch.zeros(batch_size, dtype=torch.long, device=device)
+        forward_inputs = compute_embedding_inputs(
+            model,
+            sequences,
+            organism_idx,
+            use_amp=not args.no_amp,
+            include_encoder_skips=include_encoder_skips,
+        )
+        reverse_sequences = reverse_complement_onehot_tensor(sequences)
+        reverse_inputs = compute_embedding_inputs(
+            model,
+            reverse_sequences,
+            organism_idx,
+            use_amp=not args.no_amp,
+            include_encoder_skips=include_encoder_skips,
+        )
+        for key, tensor in forward_inputs.items():
+            pending_forward[key].append(tensor.to("cpu", dtype=storage_dtype))
+        for key, tensor in reverse_inputs.items():
+            pending_reverse[key].append(tensor.to("cpu", dtype=storage_dtype))
+        for modality in dataset.modalities:
+            pending_targets[modality].append(
+                modality_targets[modality][target_resolution].detach().cpu()
+            )
+        if sum(part.shape[0] for part in pending_forward[128]) >= args.embedding_cache_chunk_size:
+            flush_chunk()
+        pbar.update(int(sequences.shape[0]))
+    flush_chunk()
+    pbar.close()
+
+    manifest = {
+        **expected_metadata,
+        "num_examples": examples_in_cache,
+        "chunks": chunks,
+    }
+    tmp_manifest_path = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
+    tmp_manifest_path.write_text(json.dumps(manifest, indent=2))
+    os.replace(tmp_manifest_path, manifest_path)
+
+
 def unwrap_heads(heads_model: nn.Module) -> TFRHeads:
     if isinstance(heads_model, DDP):
         return heads_model.module  # type: ignore[return-value]
@@ -751,9 +1363,15 @@ def crop_predictions(pred: torch.Tensor, crop_bins: int) -> torch.Tensor:
 
 def unpack_tfr_batch(
     batch: tuple[torch.Tensor, dict[str, dict[int, torch.Tensor]]]
-    | tuple[torch.Tensor, dict[str, dict[int, torch.Tensor]], dict[str, torch.Tensor]],
+    | tuple[torch.Tensor, dict[str, dict[int, torch.Tensor]], dict[str, torch.Tensor]]
+    | tuple[dict[int, torch.Tensor], dict[str, dict[int, torch.Tensor]]]
+    | tuple[
+        dict[int, torch.Tensor],
+        dict[str, dict[int, torch.Tensor]],
+        dict[str, torch.Tensor],
+    ],
 ) -> tuple[
-    torch.Tensor,
+    torch.Tensor | dict[int, torch.Tensor],
     dict[str, dict[int, torch.Tensor]],
     dict[str, torch.Tensor] | None,
 ]:
@@ -904,7 +1522,7 @@ def compute_gradient_norm(module: nn.Module) -> torch.Tensor:
 def forward_heads(
     model: torch.nn.Module,
     heads_model: nn.Module,
-    sequences: torch.Tensor,
+    inputs: torch.Tensor | dict[int | str, torch.Tensor],
     organism_idx: torch.Tensor,
     crop_bins: int,
     use_amp: bool,
@@ -913,18 +1531,21 @@ def forward_heads(
     reverse_complement: torch.Tensor | None = None,
     strand_pair_by_modality: dict[str, torch.Tensor] | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-    amp_context = autocast_context(sequences.device, use_amp)
-    with torch.no_grad():
-        with amp_context:
-            outputs = model(
-                sequences,
+    if isinstance(inputs, dict):
+        input_device = next(iter(inputs.values())).device
+        embeddings = {resolution: tensor.detach() for resolution, tensor in inputs.items()}
+    else:
+        input_device = inputs.device
+        include_encoder_skips = unwrap_heads(heads_model).target_resolution == 32
+        with torch.no_grad():
+            embeddings = compute_embedding_inputs(
+                model,
+                inputs,
                 organism_idx,
-                return_embeddings=True,
-                resolutions=(128,),
-                channels_last=False,
-                embeddings_only=True,
+                use_amp=use_amp,
+                include_encoder_skips=include_encoder_skips,
             )
-            embeddings = {128: outputs["embeddings_128bp"].detach()}
+    amp_context = autocast_context(input_device, use_amp)
     with torch.set_grad_enabled(requires_grad):
         with amp_context:
             loss_predictions = heads_model(
@@ -1044,8 +1665,16 @@ def run_epoch(
         if sequences is None or modality_targets is None:
             raise RuntimeError("Local loader is exhausted but distributed batch check passed")
 
-        sequences = sequences.to(device, non_blocking=True)
-        organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
+        if isinstance(sequences, dict):
+            model_inputs: torch.Tensor | dict[int | str, torch.Tensor] = {
+                key: tensor.to(device, non_blocking=True)
+                for key, tensor in sequences.items()
+            }
+            batch_size = next(iter(model_inputs.values())).shape[0]
+        else:
+            model_inputs = sequences.to(device, non_blocking=True)
+            batch_size = model_inputs.shape[0]
+        organism_idx = torch.zeros(batch_size, dtype=torch.long, device=device)
         reverse_complement = None
         if augmentation is not None:
             reverse_complement = augmentation["reverse_complement"].to(
@@ -1056,7 +1685,7 @@ def run_epoch(
         predictions_by_modality, metric_predictions_by_modality = forward_heads(
             model,
             heads_model,
-            sequences,
+            model_inputs,
             organism_idx,
             crop_bins,
             use_amp=not args.no_amp,
@@ -1300,6 +1929,11 @@ def resolve_pretrained_weights(
 
 def main() -> None:
     args = parse_args()
+    if args.precompute_embeddings and args.augment_shift != 0:
+        raise SystemExit(
+            "--precompute-embeddings caches original and reverse-complement "
+            "embeddings only; use --augment-shift 0."
+        )
     torch.backends.cuda.matmul.allow_tf32 = True
     rank, world_size, local_rank, device = setup_torchrun(args.device)
     wandb_run = None
@@ -1337,7 +1971,7 @@ def main() -> None:
             args.batch_size,
             args.num_workers,
             prefetch_n=args.prefetch_n,
-            persistent_workers=True,
+            persistent_workers=not args.precompute_embeddings,
         )
         val_loader = create_loader(
             val_dataset,
@@ -1426,6 +2060,108 @@ def main() -> None:
         model.eval()
         for param in model.parameters():
             param.requires_grad = False
+
+        embedding_cache_dir = None
+        if args.precompute_embeddings:
+            embedding_cache_dir = resolve_embedding_cache_dir(args, modalities, world_size)
+            print_rank0(f"Embedding cache: {embedding_cache_dir}", rank)
+            cache_train_source = create_tfr_dataset(
+                args.data_dir,
+                "train",
+                modalities,
+                args.pooling,
+                args.target_resolution,
+                repeat=False,
+                shuffle_files=False,
+                num_parallel_reads=args.tfr_num_parallel_reads,
+                rank=rank,
+                world_size=world_size,
+                augment_rc=False,
+                augment_shift=0,
+            )
+            cache_val_source = create_tfr_dataset(
+                args.data_dir,
+                "valid",
+                modalities,
+                args.pooling,
+                args.target_resolution,
+                num_parallel_reads=args.tfr_num_parallel_reads,
+                rank=rank,
+                world_size=world_size,
+                augment_rc=False,
+                augment_shift=0,
+            )
+            precompute_embedding_cache(
+                model,
+                cache_train_source,
+                args,
+                split="train",
+                cache_dir=embedding_cache_dir,
+                device=device,
+                rank=rank,
+                world_size=world_size,
+                num_workers=args.num_workers,
+            )
+            precompute_embedding_cache(
+                model,
+                cache_val_source,
+                args,
+                split="valid",
+                cache_dir=embedding_cache_dir,
+                device=device,
+                rank=rank,
+                world_size=world_size,
+                num_workers=args.val_num_workers,
+            )
+            if dist.is_available() and dist.is_initialized():
+                dist.barrier()
+            train_dataset = CachedEmbeddingTFRecordDataset(
+                embedding_cache_dir,
+                split="train",
+                source_dataset=cache_train_source,
+                rank=rank,
+                world_size=world_size,
+                augment_rc=args.augment_rc,
+                shuffle_files=True,
+            )
+            val_dataset = CachedEmbeddingTFRecordDataset(
+                embedding_cache_dir,
+                split="valid",
+                source_dataset=cache_val_source,
+                rank=rank,
+                world_size=world_size,
+                augment_rc=False,
+                shuffle_files=False,
+            )
+            train_loader = create_cached_embedding_loader(
+                train_dataset,
+                args.batch_size,
+                args.num_workers,
+                prefetch_n=args.prefetch_n,
+                persistent_workers=True,
+            )
+            val_loader = create_cached_embedding_loader(
+                val_dataset,
+                args.batch_size,
+                args.val_num_workers,
+                prefetch_n=args.prefetch_n,
+                persistent_workers=False,
+            )
+            print_rank0(
+                " ".join(
+                    (
+                        "Cached embedding loaders:",
+                        f"train_chunks={len(train_dataset.chunk_files)}",
+                        f"valid_chunks={len(val_dataset.chunk_files)}",
+                        f"train_workers={train_loader.num_workers}",
+                        f"valid_workers={val_loader.num_workers}",
+                    )
+                ),
+                rank,
+            )
+            if device.type == "cuda":
+                model.to("cpu")
+                torch.cuda.empty_cache()
 
         heads = {}
         for modality in modalities:
@@ -1527,7 +2263,7 @@ def main() -> None:
             "cell_embedding_dim": args.cell_embedding_dim,
             "n_modality_layers": len(unwrap_heads(heads_model).modality_layers),
             "head_factorization": (
-                "cell_bottleneck_linear_then_unet32bp_modality_mlp"
+                "cell_bottleneck_linear_then_encoder_skip_unet32bp_modality_mlp"
                 if args.target_resolution == 32
                 else "cell_bottleneck_linear_then_modality_mlp"
             ),
@@ -1560,6 +2296,14 @@ def main() -> None:
             "use_amp": not args.no_amp,
             "augment_rc": args.augment_rc,
             "augment_shift": args.augment_shift,
+            "precompute_embeddings": args.precompute_embeddings,
+            "embedding_cache_dir": (
+                str(embedding_cache_dir)
+                if embedding_cache_dir is not None
+                else None
+            ),
+            "embedding_cache_dtype": args.embedding_cache_dtype,
+            "embedding_cache_chunk_size": args.embedding_cache_chunk_size,
         }
         if is_main_process(rank):
             (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
