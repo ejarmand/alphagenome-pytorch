@@ -78,6 +78,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--split", default="test", choices=["train", "valid", "test"])
     parser.add_argument("--pooling", choices=["mean", "sum"], default=None)
+    parser.add_argument("--target-resolution", type=int, choices=[32, 128], default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--prefetch-n", type=int, default=1)
@@ -174,6 +175,7 @@ def create_heads_model(
     metadata: dict[str, Any],
     checkpoint: dict[str, Any],
     device: torch.device,
+    target_resolution: int,
 ) -> TFRHeads:
     heads = {}
     for modality in modalities:
@@ -207,6 +209,7 @@ def create_heads_model(
         heads,
         cell_types_by_modality,
         cell_embedding_dim=int(metadata.get("cell_embedding_dim", 16)),
+        target_resolution=target_resolution,
     ).to(device)
 
     state_dict = (
@@ -357,6 +360,7 @@ def evaluate(
     device: torch.device,
     args: argparse.Namespace,
     crop_bins: int,
+    target_resolution: int,
     rank: int,
     world_size: int,
     h5_writer: H5PredictionWriter | None = None,
@@ -432,7 +436,7 @@ def evaluate(
         batch_loss = torch.tensor(0.0, device=device)
         cropped_targets_by_modality = {}
         for modality, pred in loss_predictions.items():
-            target = modality_targets[modality][128].to(device, non_blocking=True)
+            target = modality_targets[modality][target_resolution].to(device, non_blocking=True)
             if pred.shape != target.shape:
                 raise ValueError(
                     f"{modality}: prediction shape {tuple(pred.shape)} does not match "
@@ -589,6 +593,8 @@ def main() -> None:
 
     if args.pooling is None:
         args.pooling = metadata.get("pooling", "mean")
+    if args.target_resolution is None:
+        args.target_resolution = int(metadata.get("target_resolution", 128))
     if args.loss is None:
         args.loss = metadata.get("loss", "poisson-multinomial")
     if args.batch_size is None:
@@ -606,6 +612,7 @@ def main() -> None:
             args.split,
             modalities,
             args.pooling,
+            args.target_resolution,
             repeat=False,
             shuffle_files=False,
             num_parallel_reads=args.tfr_num_parallel_reads,
@@ -622,7 +629,7 @@ def main() -> None:
         crop_bins = (
             args.crop_bins
             if args.crop_bins is not None
-            else int(metadata.get("crop_bins_128bp", dataset.prediction_crop_128bp))
+            else int(metadata.get("crop_bins", dataset.prediction_crop_bins))
         )
 
         if is_main_process(rank):
@@ -644,6 +651,7 @@ def main() -> None:
                         f"batch_size={args.batch_size}",
                         f"workers={loader.num_workers}",
                         f"crop_bins={crop_bins}",
+                        f"target_resolution={args.target_resolution}",
                     )
                 )
             )
@@ -659,7 +667,14 @@ def main() -> None:
         for param in model.parameters():
             param.requires_grad = False
 
-        heads_model = create_heads_model(dataset, modalities, metadata, checkpoint, device)
+        heads_model = create_heads_model(
+            dataset,
+            modalities,
+            metadata,
+            checkpoint,
+            device,
+            args.target_resolution,
+        )
         h5_writer = None
         if args.save:
             h5_writer = H5PredictionWriter(
@@ -681,6 +696,7 @@ def main() -> None:
                 device,
                 args,
                 crop_bins,
+                args.target_resolution,
                 rank,
                 world_size,
                 h5_writer=h5_writer,

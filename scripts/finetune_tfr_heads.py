@@ -35,13 +35,56 @@ from alphagenome_pytorch.heads import EMBEDDING_128BP_DIM
 from alphagenome_pytorch.losses import multinomial_loss
 
 
+DEFAULT_HF_MODEL_ID = "gtca/alphagenome_pytorch"
+DEFAULT_HF_FILENAME = "model_fold_1.safetensors"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train a new AlphaGenome head from Baskerville TFRecords.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--data-dir", type=Path, required=True)
-    parser.add_argument("--pretrained-weights", type=Path)
+    parser.add_argument(
+        "--pretrained-weights",
+        type=Path,
+        help=(
+            "Local PyTorch weights (.pth/.safetensors). If omitted, downloads "
+            "--hf-filename from --hf-model-id."
+        ),
+    )
+    parser.add_argument(
+        "--hf-model-id",
+        default=DEFAULT_HF_MODEL_ID,
+        help=(
+            "Hugging Face AlphaGenome PyTorch checkpoint repo to download from "
+            "when --pretrained-weights is omitted."
+        ),
+    )
+    parser.add_argument(
+        "--hf-filename",
+        default=DEFAULT_HF_FILENAME,
+        help="Checkpoint filename in --hf-model-id to download.",
+    )
+    parser.add_argument(
+        "--hf-revision",
+        default=None,
+        help="Optional Hugging Face revision for --hf-model-id.",
+    )
+    parser.add_argument(
+        "--hf-token",
+        default=None,
+        help=(
+            "Optional Hugging Face token. If omitted, huggingface_hub uses the "
+            "cached login token or HF_TOKEN/HUGGING_FACE_HUB_TOKEN."
+        ),
+    )
+    parser.add_argument(
+        "--hf-cache-dir",
+        type=Path,
+        default=None,
+        help="Optional Hugging Face cache directory for the downloaded safetensors file.",
+    )
     parser.add_argument(
         "--modality",
         action="append",
@@ -1205,6 +1248,56 @@ def resolve_modalities(args: argparse.Namespace) -> list[str]:
     return requested
 
 
+def download_hf_weights(args: argparse.Namespace) -> Path:
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as exc:
+        raise ImportError(
+            "Downloading AlphaGenome weights from Hugging Face requires "
+            "`huggingface_hub`. Install it or pass --pretrained-weights."
+        ) from exc
+
+    try:
+        weights_path = hf_hub_download(
+            repo_id=args.hf_model_id,
+            filename=args.hf_filename,
+            revision=args.hf_revision,
+            repo_type="model",
+            cache_dir=str(args.hf_cache_dir) if args.hf_cache_dir is not None else None,
+            token=args.hf_token,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to download Hugging Face weights "
+            f"{args.hf_model_id!r}/{args.hf_filename!r}. "
+            "Pass --hf-token if the repo requires authentication, or pass "
+            "--pretrained-weights with a local checkpoint."
+        ) from exc
+    return Path(weights_path)
+
+
+def resolve_pretrained_weights(
+    args: argparse.Namespace,
+    rank: int,
+) -> Path:
+    if args.pretrained_weights is not None:
+        return args.pretrained_weights
+
+    resolved: Path | None = None
+    if is_main_process(rank):
+        print(
+            "No --pretrained-weights supplied; downloading base checkpoint "
+            f"{args.hf_model_id}/{args.hf_filename}."
+        )
+        resolved = download_hf_weights(args)
+        print(f"Using Hugging Face PyTorch weights: {resolved}")
+
+    resolved = broadcast_object(str(resolved), src=0)
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+    return Path(resolved)
+
+
 def main() -> None:
     args = parse_args()
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -1295,8 +1388,9 @@ def main() -> None:
         if args.loader_only:
             return
 
-        if args.pretrained_weights is None:
-            raise SystemExit("--pretrained-weights is required unless --loader-only is set")
+        pretrained_weights_arg = args.pretrained_weights
+        pretrained_weights = resolve_pretrained_weights(args, rank)
+        args.pretrained_weights = pretrained_weights
 
         print_rank0(f"Device: {device} local_rank={local_rank}", rank)
         dtype_policy = (
@@ -1327,7 +1421,7 @@ def main() -> None:
         track_means = broadcast_object(track_means, src=0)
 
         model = AlphaGenome(dtype_policy=dtype_policy)
-        model = load_trunk(model, str(args.pretrained_weights), exclude_heads=True)
+        model = load_trunk(model, str(pretrained_weights), exclude_heads=True)
         model = remove_all_heads(model).to(device)
         model.eval()
         for param in model.parameters():
@@ -1442,7 +1536,13 @@ def main() -> None:
             "crop_bins_128bp": train_dataset.prediction_crop_128bp,
             "target_length_128bp": train_dataset.output_length_128bp,
             "loss": args.loss,
-            "pretrained_weights": str(args.pretrained_weights),
+            "pretrained_weights": str(pretrained_weights),
+            "pretrained_weights_source": (
+                "local" if pretrained_weights_arg is not None else "huggingface"
+            ),
+            "hf_model_id": None if pretrained_weights_arg is not None else args.hf_model_id,
+            "hf_filename": None if pretrained_weights_arg is not None else args.hf_filename,
+            "hf_revision": None if pretrained_weights_arg is not None else args.hf_revision,
             "world_size": world_size,
             "batch_size": args.batch_size,
             "num_workers": args.num_workers,
