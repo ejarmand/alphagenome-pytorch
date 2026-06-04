@@ -393,20 +393,29 @@ class CachedEmbeddingTFRecordDataset(IterableDataset):
         self.assay_type_by_modality = source_dataset.assay_type_by_modality
         self._global_length = len(source_dataset)
 
-        self.manifest_path = embedding_cache_manifest_path(
-            self.cache_dir,
-            split,
-            rank,
-            world_size,
-        )
-        if not self.manifest_path.exists():
-            raise FileNotFoundError(
-                f"Cached embedding manifest not found: {self.manifest_path}"
+        file_index_by_path = {
+            path.resolve(): file_idx
+            for file_idx, path in enumerate(source_dataset.files)
+        }
+        manifests = []
+        for source_file in source_dataset._worker_files():
+            file_idx = file_index_by_path[source_file.resolve()]
+            manifest_path = embedding_cache_file_manifest_path(
+                self.cache_dir,
+                split,
+                file_idx,
             )
-        self.manifest = json.loads(self.manifest_path.read_text())
+            if not manifest_path.exists():
+                raise FileNotFoundError(
+                    f"Cached embedding file manifest not found: {manifest_path}"
+                )
+            manifests.append(json.loads(manifest_path.read_text()))
+
+        self.manifests = manifests
         self.chunk_files = [
             self.cache_dir / chunk["path"]
-            for chunk in self.manifest.get("chunks", [])
+            for manifest in self.manifests
+            for chunk in manifest.get("chunks", [])
         ]
         missing = [path for path in self.chunk_files if not path.exists()]
         if missing:
@@ -976,13 +985,12 @@ def broadcast_object(obj: Any, src: int = 0) -> Any:
     return objects[0]
 
 
-def embedding_cache_manifest_path(
+def embedding_cache_file_manifest_path(
     cache_dir: Path,
     split: str,
-    rank: int,
-    world_size: int,
+    file_index: int,
 ) -> Path:
-    return cache_dir / f"{split}.rank{rank:05d}-of{world_size:05d}.json"
+    return cache_dir / f"{split}.file{file_index:05d}.json"
 
 
 def resolve_embedding_cache_dir(
@@ -1004,7 +1012,6 @@ def resolve_embedding_cache_dir(
         "target_resolution": args.target_resolution,
         "dtype": args.dtype,
         "cache_dtype": args.embedding_cache_dtype,
-        "world_size": world_size,
     }
     cache_key = hashlib.sha1(
         json.dumps(key_payload, sort_keys=True).encode("utf-8")
@@ -1016,14 +1023,10 @@ def embedding_cache_expected_metadata(
     args: argparse.Namespace,
     dataset: BaskervilleMultiTFRecordDataset,
     split: str,
-    rank: int,
-    world_size: int,
 ) -> dict[str, Any]:
     return {
-        "format_version": 1,
+        "format_version": 2,
         "split": split,
-        "rank": rank,
-        "world_size": world_size,
         "data_dir": str(args.data_dir.resolve()),
         "pretrained_weights": (
             str(args.pretrained_weights.resolve())
@@ -1045,10 +1048,11 @@ def embedding_cache_expected_metadata(
     }
 
 
-def embedding_cache_ready(
+def embedding_cache_file_ready(
     manifest_path: Path,
     expected_metadata: dict[str, Any],
     *,
+    source_file: Path,
     refresh: bool,
 ) -> bool:
     if refresh or not manifest_path.exists():
@@ -1064,11 +1068,44 @@ def embedding_cache_ready(
             "requested data/model settings. Use --refresh-embedding-cache or "
             "choose a different --embedding-cache-dir."
         )
+    if manifest.get("file_name") != source_file.name:
+        raise ValueError(
+            f"Embedding cache manifest {manifest_path} is for "
+            f"{manifest.get('file_name')!r}, expected {source_file.name!r}."
+        )
     chunks = manifest.get("chunks", [])
     return bool(chunks) and all(
         (manifest_path.parent / chunk["path"]).exists()
         for chunk in chunks
     )
+
+
+def embedding_cache_ready(
+    cache_dir: Path,
+    expected_metadata: dict[str, Any],
+    source_dataset: BaskervilleMultiTFRecordDataset,
+    *,
+    refresh: bool,
+) -> bool:
+    file_index_by_path = {
+        path.resolve(): file_idx
+        for file_idx, path in enumerate(source_dataset.files)
+    }
+    for source_file in source_dataset._worker_files():
+        file_idx = file_index_by_path[source_file.resolve()]
+        manifest_path = embedding_cache_file_manifest_path(
+            cache_dir,
+            source_dataset.split,
+            file_idx,
+        )
+        if not embedding_cache_file_ready(
+            manifest_path,
+            expected_metadata,
+            source_file=source_file,
+            refresh=refresh,
+        ):
+            return False
+    return True
 
 
 def cache_storage_dtype(name: str) -> torch.dtype:
@@ -1145,155 +1182,218 @@ def precompute_embedding_cache(
             f"{args.embedding_cache_chunk_size}"
         )
     cache_dir.mkdir(parents=True, exist_ok=True)
-    manifest_path = embedding_cache_manifest_path(cache_dir, split, rank, world_size)
     expected_metadata = embedding_cache_expected_metadata(
         args,
         dataset,
         split,
-        rank,
-        world_size,
     )
     if embedding_cache_ready(
-        manifest_path,
+        cache_dir,
         expected_metadata,
+        dataset,
         refresh=args.refresh_embedding_cache,
     ):
         print_rank0(
-            f"Using existing {split} embedding cache at {manifest_path}",
+            f"Using existing {split} embedding cache at {cache_dir}",
             rank,
         )
         return
 
-    loader = create_loader(
-        dataset,
-        args.batch_size,
-        num_workers,
-        prefetch_n=args.prefetch_n,
-        persistent_workers=False,
-    )
     storage_dtype = cache_storage_dtype(args.embedding_cache_dtype)
     target_resolution = args.target_resolution
     include_encoder_skips = target_resolution == 32
-    chunks: list[dict[str, Any]] = []
-    chunk_idx = 0
-    examples_in_cache = 0
-    pending_forward: dict[int | str, list[torch.Tensor]] = {128: []}
-    pending_reverse: dict[int | str, list[torch.Tensor]] = {128: []}
-    if include_encoder_skips:
-        pending_forward[ENCODER_SKIP_64BP_KEY] = []
-        pending_forward[ENCODER_SKIP_32BP_KEY] = []
-        pending_reverse[ENCODER_SKIP_64BP_KEY] = []
-        pending_reverse[ENCODER_SKIP_32BP_KEY] = []
-    pending_targets: dict[str, list[torch.Tensor]] = {
-        modality: []
-        for modality in dataset.modalities
-    }
 
-    def flush_chunk() -> None:
-        nonlocal chunk_idx, examples_in_cache
-        if not pending_forward[128]:
-            return
-        forward_inputs = {
-            key: torch.cat(parts, dim=0)
-            for key, parts in pending_forward.items()
-        }
-        reverse_inputs = {
-            key: torch.cat(parts, dim=0)
-            for key, parts in pending_reverse.items()
-        }
-        embeddings_forward = forward_inputs[128]
-        embeddings_reverse = reverse_inputs[128]
-        targets = {
-            modality: {target_resolution: torch.cat(parts, dim=0)}
-            for modality, parts in pending_targets.items()
-        }
-        chunk_name = f"{split}.rank{rank:05d}.chunk{chunk_idx:06d}.pt"
-        chunk_payload = {
-            "embeddings_forward_128bp": embeddings_forward,
-            "embeddings_reverse_128bp": embeddings_reverse,
-            "targets": targets,
-        }
-        if include_encoder_skips:
-            chunk_payload.update({
-                "encoder_skip_forward_64bp": forward_inputs[ENCODER_SKIP_64BP_KEY],
-                "encoder_skip_reverse_64bp": reverse_inputs[ENCODER_SKIP_64BP_KEY],
-                "encoder_skip_forward_32bp": forward_inputs[ENCODER_SKIP_32BP_KEY],
-                "encoder_skip_reverse_32bp": reverse_inputs[ENCODER_SKIP_32BP_KEY],
-            })
-        torch.save(chunk_payload, cache_dir / chunk_name)
-        chunks.append({
-            "path": chunk_name,
-            "num_examples": int(embeddings_forward.shape[0]),
-            "embedding_shape": list(embeddings_forward.shape[1:]),
-            "embedding_dtype": str(embeddings_forward.dtype).replace("torch.", ""),
-            "encoder_skip_shapes": (
-                {
-                    "64bp": list(forward_inputs[ENCODER_SKIP_64BP_KEY].shape[1:]),
-                    "32bp": list(forward_inputs[ENCODER_SKIP_32BP_KEY].shape[1:]),
-                }
-                if include_encoder_skips
-                else None
-            ),
-            "target_resolution": target_resolution,
-        })
-        examples_in_cache += int(embeddings_forward.shape[0])
-        chunk_idx += 1
-        for parts in pending_forward.values():
-            parts.clear()
-        for parts in pending_reverse.values():
-            parts.clear()
-        for parts in pending_targets.values():
-            parts.clear()
+    file_index_by_path = {
+        path.resolve(): file_idx
+        for file_idx, path in enumerate(dataset.files)
+    }
+    source_files = dataset._worker_files()
 
     pbar = tqdm(
         desc=f"cache-{split}",
         disable=not is_main_process(rank),
         total=None,
     )
-    for batch in loader:
-        sequences, modality_targets, _augmentation = unpack_tfr_batch(batch)
-        if isinstance(sequences, dict):
-            raise TypeError("Embedding precompute expects sequence TFRecord batches")
-        sequences = sequences.to(device, non_blocking=True)
-        batch_size = sequences.shape[0]
-        organism_idx = torch.zeros(batch_size, dtype=torch.long, device=device)
-        forward_inputs = compute_embedding_inputs(
-            model,
-            sequences,
-            organism_idx,
-            use_amp=not args.no_amp,
-            include_encoder_skips=include_encoder_skips,
-        )
-        reverse_sequences = reverse_complement_onehot_tensor(sequences)
-        reverse_inputs = compute_embedding_inputs(
-            model,
-            reverse_sequences,
-            organism_idx,
-            use_amp=not args.no_amp,
-            include_encoder_skips=include_encoder_skips,
-        )
-        for key, tensor in forward_inputs.items():
-            pending_forward[key].append(tensor.to("cpu", dtype=storage_dtype))
-        for key, tensor in reverse_inputs.items():
-            pending_reverse[key].append(tensor.to("cpu", dtype=storage_dtype))
-        for modality in dataset.modalities:
-            pending_targets[modality].append(
-                modality_targets[modality][target_resolution].detach().cpu()
+
+    def write_file_cache(source_file: Path, file_idx: int) -> None:
+        manifest_path = embedding_cache_file_manifest_path(cache_dir, split, file_idx)
+        if embedding_cache_file_ready(
+            manifest_path,
+            expected_metadata,
+            source_file=source_file,
+            refresh=args.refresh_embedding_cache,
+        ):
+            return
+
+        chunks: list[dict[str, Any]] = []
+        chunk_idx = 0
+        examples_in_cache = 0
+        pending_forward: dict[int | str, list[torch.Tensor]] = {128: []}
+        pending_reverse: dict[int | str, list[torch.Tensor]] = {128: []}
+        if include_encoder_skips:
+            pending_forward[ENCODER_SKIP_64BP_KEY] = []
+            pending_forward[ENCODER_SKIP_32BP_KEY] = []
+            pending_reverse[ENCODER_SKIP_64BP_KEY] = []
+            pending_reverse[ENCODER_SKIP_32BP_KEY] = []
+        pending_targets: dict[str, list[torch.Tensor]] = {
+            modality: []
+            for modality in dataset.modalities
+        }
+        sequence_batch: list[torch.Tensor] = []
+        target_batch: dict[str, list[torch.Tensor]] = {
+            modality: []
+            for modality in dataset.modalities
+        }
+
+        def flush_chunk() -> None:
+            nonlocal chunk_idx, examples_in_cache
+            if not pending_forward[128]:
+                return
+            forward_inputs = {
+                key: torch.cat(parts, dim=0)
+                for key, parts in pending_forward.items()
+            }
+            reverse_inputs = {
+                key: torch.cat(parts, dim=0)
+                for key, parts in pending_reverse.items()
+            }
+            embeddings_forward = forward_inputs[128]
+            embeddings_reverse = reverse_inputs[128]
+            targets = {
+                modality: {target_resolution: torch.cat(parts, dim=0)}
+                for modality, parts in pending_targets.items()
+            }
+            chunk_name = (
+                f"{split}.file{file_idx:05d}.chunk{chunk_idx:06d}.pt"
             )
-        if sum(part.shape[0] for part in pending_forward[128]) >= args.embedding_cache_chunk_size:
-            flush_chunk()
-        pbar.update(int(sequences.shape[0]))
-    flush_chunk()
+            chunk_payload = {
+                "embeddings_forward_128bp": embeddings_forward,
+                "embeddings_reverse_128bp": embeddings_reverse,
+                "targets": targets,
+            }
+            if include_encoder_skips:
+                chunk_payload.update({
+                    "encoder_skip_forward_64bp": forward_inputs[ENCODER_SKIP_64BP_KEY],
+                    "encoder_skip_reverse_64bp": reverse_inputs[ENCODER_SKIP_64BP_KEY],
+                    "encoder_skip_forward_32bp": forward_inputs[ENCODER_SKIP_32BP_KEY],
+                    "encoder_skip_reverse_32bp": reverse_inputs[ENCODER_SKIP_32BP_KEY],
+                })
+            torch.save(chunk_payload, cache_dir / chunk_name)
+            chunks.append({
+                "path": chunk_name,
+                "num_examples": int(embeddings_forward.shape[0]),
+                "embedding_shape": list(embeddings_forward.shape[1:]),
+                "embedding_dtype": str(embeddings_forward.dtype).replace("torch.", ""),
+                "encoder_skip_shapes": (
+                    {
+                        "64bp": list(forward_inputs[ENCODER_SKIP_64BP_KEY].shape[1:]),
+                        "32bp": list(forward_inputs[ENCODER_SKIP_32BP_KEY].shape[1:]),
+                    }
+                    if include_encoder_skips
+                    else None
+                ),
+                "target_resolution": target_resolution,
+            })
+            examples_in_cache += int(embeddings_forward.shape[0])
+            chunk_idx += 1
+            for parts in pending_forward.values():
+                parts.clear()
+            for parts in pending_reverse.values():
+                parts.clear()
+            for parts in pending_targets.values():
+                parts.clear()
+
+        def flush_model_batch() -> None:
+            if not sequence_batch:
+                return
+            sequences = torch.stack(sequence_batch, dim=0).to(device, non_blocking=True)
+            batch_size = sequences.shape[0]
+            organism_idx = torch.zeros(batch_size, dtype=torch.long, device=device)
+            forward_inputs = compute_embedding_inputs(
+                model,
+                sequences,
+                organism_idx,
+                use_amp=not args.no_amp,
+                include_encoder_skips=include_encoder_skips,
+            )
+            reverse_sequences = reverse_complement_onehot_tensor(sequences)
+            reverse_inputs = compute_embedding_inputs(
+                model,
+                reverse_sequences,
+                organism_idx,
+                use_amp=not args.no_amp,
+                include_encoder_skips=include_encoder_skips,
+            )
+            for key, tensor in forward_inputs.items():
+                pending_forward[key].append(tensor.to("cpu", dtype=storage_dtype))
+            for key, tensor in reverse_inputs.items():
+                pending_reverse[key].append(tensor.to("cpu", dtype=storage_dtype))
+            for modality in dataset.modalities:
+                pending_targets[modality].append(
+                    torch.stack(target_batch[modality], dim=0).detach().cpu()
+                )
+                target_batch[modality].clear()
+            sequence_batch.clear()
+            if (
+                sum(part.shape[0] for part in pending_forward[128])
+                >= args.embedding_cache_chunk_size
+            ):
+                flush_chunk()
+            pbar.update(batch_size)
+
+        tf_dataset = dataset._tf_dataset([source_file])
+        if tf_dataset is None:
+            raise FileNotFoundError(f"No TFRecords found for cache file {source_file}")
+        tf = dataset._ensure_tensorflow_cpu()
+        feature_spec = {
+            "sequence": tf.io.FixedLenFeature([], tf.string),
+            "target": tf.io.FixedLenFeature([], tf.string),
+        }
+        for record in tf_dataset:
+            parsed = tf.io.parse_single_example(record, feature_spec)
+            sequence = dataset._decode_sequence(
+                parsed["sequence"].numpy(),
+                dataset.metadata.seq_length,
+            )
+            full_target = dataset._decode_full_target(parsed["target"].numpy())
+            sequence_batch.append(torch.from_numpy(sequence).float())
+            for modality, indices in dataset.target_indices_by_modality.items():
+                target = full_target[:, indices].astype("float32", copy=False)
+                target = dataset._target_for_resolution(target)
+                target_batch[modality].append(torch.from_numpy(target).float())
+            if len(sequence_batch) >= args.batch_size:
+                flush_model_batch()
+        flush_model_batch()
+        flush_chunk()
+
+        if examples_in_cache == 0:
+            raise RuntimeError(f"No examples were cached for {source_file}")
+
+        manifest = {
+            **expected_metadata,
+            "file_index": file_idx,
+            "file_name": source_file.name,
+            "num_examples": examples_in_cache,
+            "chunks": chunks,
+        }
+        tmp_manifest_path = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
+        tmp_manifest_path.write_text(json.dumps(manifest, indent=2))
+        os.replace(tmp_manifest_path, manifest_path)
+
+    for source_file in source_files:
+        file_idx = file_index_by_path[source_file.resolve()]
+        write_file_cache(source_file, file_idx)
     pbar.close()
 
-    manifest = {
-        **expected_metadata,
-        "num_examples": examples_in_cache,
-        "chunks": chunks,
-    }
-    tmp_manifest_path = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
-    tmp_manifest_path.write_text(json.dumps(manifest, indent=2))
-    os.replace(tmp_manifest_path, manifest_path)
+    if not embedding_cache_ready(
+        cache_dir,
+        expected_metadata,
+        dataset,
+        refresh=False,
+    ):
+        raise RuntimeError(
+            f"Embedding cache for split={split!r} was not fully written by rank {rank}"
+        )
 
 
 def unwrap_heads(heads_model: nn.Module) -> TFRHeads:
@@ -1556,14 +1656,21 @@ def forward_heads(
 
     with torch.no_grad():
         if not return_scaled:
-            metric_predictions = loss_predictions
+            metric_predictions = {
+                modality: prediction.detach()
+                for modality, prediction in loss_predictions.items()
+            }
         else:
-            with amp_context:
-                metric_predictions = unwrap_heads(heads_model)(
-                    embeddings,
+            unwrapped_heads = unwrap_heads(heads_model)
+            metric_predictions = {
+                modality: unwrapped_heads.heads[modality].unscale(
+                    prediction.detach(),
                     organism_idx,
-                    return_scaled=False,
+                    unwrapped_heads.target_resolution,
+                    channels_last=True,
                 )
+                for modality, prediction in loss_predictions.items()
+            }
 
     switched_loss_predictions = {}
     switched_metric_predictions = {}

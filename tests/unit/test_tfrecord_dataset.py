@@ -31,7 +31,7 @@ from scripts.finetune_tfr_heads import (
     compute_loss,
     compute_regression_metrics,
     cell_types_from_target_rows,
-    embedding_cache_manifest_path,
+    embedding_cache_file_manifest_path,
     forward_heads,
     new_metric_stats,
     switch_reverse_predictions,
@@ -505,7 +505,8 @@ def test_cached_embedding_dataset_selects_reverse_embedding_with_rc_flag(
     )
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
-    chunk_name = "train.rank00000.chunk000000.pt"
+    source_dataset.files = [source_dataset.files[0]]
+    chunk_name = "train.file00000.chunk000000.pt"
     torch.save(
         {
             "embeddings_forward_128bp": torch.ones(1, 4, 2),
@@ -522,8 +523,11 @@ def test_cached_embedding_dataset_selects_reverse_embedding_with_rc_flag(
         },
         cache_dir / chunk_name,
     )
-    embedding_cache_manifest_path(cache_dir, "train", 0, 1).write_text(
-        json.dumps({"chunks": [{"path": chunk_name, "num_examples": 1}]})
+    embedding_cache_file_manifest_path(cache_dir, "train", 0).write_text(
+        json.dumps({
+            "file_name": source_dataset.files[0].name,
+            "chunks": [{"path": chunk_name, "num_examples": 1}],
+        })
     )
 
     dataset = CachedEmbeddingTFRecordDataset(
@@ -551,6 +555,54 @@ def test_cached_embedding_dataset_selects_reverse_embedding_with_rc_flag(
         targets["ATAC"][target_resolution],
         torch.full(target_shape, 3.0),
     )
+
+
+def test_cached_embedding_dataset_uses_file_shards_for_rank_world_size(tmp_path):
+    data_dir = _write_minimal_dataset(tmp_path)
+    source_dataset = BaskervilleMultiTFRecordDataset(
+        data_dir,
+        modalities=["ATAC"],
+        target_resolution=128,
+        rank=1,
+        world_size=2,
+    )
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+
+    for file_idx, source_file in enumerate(source_dataset.files):
+        chunk_name = f"train.file{file_idx:05d}.chunk000000.pt"
+        torch.save(
+            {
+                "embeddings_forward_128bp": torch.full((1, 4, 2), float(file_idx)),
+                "embeddings_reverse_128bp": torch.full((1, 4, 2), -float(file_idx)),
+                "targets": {
+                    "ATAC": {
+                        128: torch.full((1, 2, 2), float(file_idx + 10))
+                    }
+                },
+            },
+            cache_dir / chunk_name,
+        )
+        embedding_cache_file_manifest_path(cache_dir, "train", file_idx).write_text(
+            json.dumps({
+                "file_name": source_file.name,
+                "chunks": [{"path": chunk_name, "num_examples": 1}],
+            })
+        )
+
+    dataset = CachedEmbeddingTFRecordDataset(
+        cache_dir,
+        split="train",
+        source_dataset=source_dataset,
+        rank=1,
+        world_size=2,
+    )
+
+    embeddings, targets = next(iter(dataset))
+
+    assert len(dataset.chunk_files) == 1
+    torch.testing.assert_close(embeddings[128], torch.full((4, 2), 1.0))
+    torch.testing.assert_close(targets["ATAC"][128], torch.full((2, 2), 11.0))
 
 
 def test_collate_tfr_cached_embeddings_with_augmentation():
@@ -601,6 +653,46 @@ def test_forward_heads_uses_cached_embeddings_without_model_forward():
     expected = embeddings[128].transpose(1, 2)
     torch.testing.assert_close(predictions["ATAC"], expected)
     torch.testing.assert_close(metric_predictions["ATAC"], expected)
+
+
+def test_forward_heads_unscales_training_metrics_without_second_head_forward():
+    class FakeHead(torch.nn.Module):
+        def unscale(self, x, organism_idx, resolution, channels_last=True):
+            del organism_idx, resolution, channels_last
+            return x + 10.0
+
+    class CountingHeads(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+            self.target_resolution = 128
+            self.heads = torch.nn.ModuleDict({"ATAC": FakeHead()})
+
+        def forward(self, embeddings, organism_idx, *, return_scaled):
+            del organism_idx
+            self.calls += 1
+            assert return_scaled is True
+            return {"ATAC": embeddings[128].transpose(1, 2)}
+
+    heads = CountingHeads()
+    embeddings = {128: torch.arange(6, dtype=torch.float32).reshape(1, 2, 3)}
+    organism_idx = torch.zeros(1, dtype=torch.long)
+
+    predictions, metric_predictions = forward_heads(
+        torch.nn.Module(),
+        heads,
+        embeddings,
+        organism_idx,
+        crop_bins=0,
+        use_amp=False,
+        return_scaled=True,
+        requires_grad=True,
+    )
+
+    expected = embeddings[128].transpose(1, 2)
+    assert heads.calls == 1
+    torch.testing.assert_close(predictions["ATAC"], expected)
+    torch.testing.assert_close(metric_predictions["ATAC"], expected + 10.0)
 
 
 def test_poisson_multinomial_loss_alias_runs():
