@@ -20,6 +20,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.checkpoint import checkpoint
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 from tqdm import tqdm
 
@@ -237,6 +238,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=16,
         help="Number of examples per cached embedding chunk file.",
+    )
+    parser.add_argument(
+        "--grad-checkpoint",
+        action="store_true",
+        help=(
+            "Recompute the 32 bp upsampler's ConvNormGelu blocks during backward "
+            "instead of storing their activations. Cuts head activation memory "
+            "(~37%% at 32 bp) for ~15-30%% more compute; no effect at 128 bp."
+        ),
     )
     parser.add_argument("--output-dir", type=Path, default=Path("finetuning_output/tfr_heads"))
     parser.add_argument("--run-name", default=None)
@@ -661,11 +671,16 @@ class CellTypeEmbedding(nn.Module):
 class ModalityDecoder(nn.Module):
     """Shared per-modality decoder from cell embeddings to one track value."""
 
-    def __init__(self, embedding_dim: int, target_resolution: int = 128):
+    def __init__(
+        self,
+        embedding_dim: int,
+        target_resolution: int = 128,
+        grad_checkpoint: bool = False,
+    ):
         super().__init__()
         self.target_resolution = target_resolution
         if target_resolution == 32:
-            self.upscaler = EncoderSkip32bpUpsampler(embedding_dim)
+            self.upscaler = EncoderSkip32bpUpsampler(embedding_dim, grad_checkpoint)
         elif target_resolution == 128:
             self.upscaler = nn.Identity()
         else:
@@ -720,8 +735,9 @@ class ConvNormGelu(nn.Module):
 class EncoderSkip32bpUpsampler(nn.Module):
     """Upscale 128 bp cell embeddings to 32 bp bins using encoder skip features."""
 
-    def __init__(self, channels: int):
+    def __init__(self, channels: int, grad_checkpoint: bool = False):
         super().__init__()
+        self.grad_checkpoint = grad_checkpoint
         self.stem = ConvNormGelu(channels)
         self.skip_64bp = nn.Conv1d(1536, channels, kernel_size=1)
         self.skip_32bp = nn.Conv1d(1408, channels, kernel_size=1)
@@ -731,6 +747,14 @@ class EncoderSkip32bpUpsampler(nn.Module):
             stdv = 1.0 / math.sqrt(layer.in_channels)
             nn.init.trunc_normal_(layer.weight, std=stdv)
             nn.init.zeros_(layer.bias)
+
+    def _refine(self, block: nn.Module, x: torch.Tensor) -> torch.Tensor:
+        # Recompute the block's norm/gelu/conv activations in backward instead of
+        # storing them; these fp32 GroupNorm tensors at 8192/16384 length dominate
+        # the 32 bp head's activation memory.
+        if self.grad_checkpoint and torch.is_grad_enabled() and x.requires_grad:
+            return checkpoint(block, x, use_reentrant=False)
+        return block(x)
 
     def forward(
         self,
@@ -748,17 +772,17 @@ class EncoderSkip32bpUpsampler(nn.Module):
                 "32 bp upsampling requires encoder_skip_64bp and encoder_skip_32bp"
             )
 
-        x_128bp = x + self.stem(x)
+        x_128bp = x + self._refine(self.stem, x)
 
         projected_64bp = self.skip_64bp(skip_64bp).repeat_interleave(n_cells, dim=0)
         up_64bp = F.interpolate(x_128bp, size=projected_64bp.shape[-1], mode="nearest")
         up_64bp = up_64bp + projected_64bp
-        up_64bp = up_64bp + self.up_refine_64bp(up_64bp)
+        up_64bp = up_64bp + self._refine(self.up_refine_64bp, up_64bp)
 
         projected_32bp = self.skip_32bp(skip_32bp).repeat_interleave(n_cells, dim=0)
         up_32bp = F.interpolate(up_64bp, size=projected_32bp.shape[-1], mode="nearest")
         up_32bp = up_32bp + projected_32bp
-        return up_32bp + self.up_refine_32bp(up_32bp)
+        return up_32bp + self._refine(self.up_refine_32bp, up_32bp)
 
 
 class TFRHeads(nn.Module):
@@ -771,6 +795,7 @@ class TFRHeads(nn.Module):
         embedding_dim: int = EMBEDDING_128BP_DIM,
         cell_embedding_dim: int = 16,
         target_resolution: int = 128,
+        grad_checkpoint: bool = False,
     ):
         super().__init__()
         if cell_embedding_dim < 1:
@@ -784,7 +809,9 @@ class TFRHeads(nn.Module):
         self.target_resolution = target_resolution
         self.heads = nn.ModuleDict(heads)
         self.modality_layers = nn.ModuleDict({
-            modality: self._create_modality_layer(cell_embedding_dim, target_resolution)
+            modality: self._create_modality_layer(
+                cell_embedding_dim, target_resolution, grad_checkpoint
+            )
             for modality in heads
         })
         self.cell_key_by_type = (
@@ -823,8 +850,9 @@ class TFRHeads(nn.Module):
     def _create_modality_layer(
         embedding_dim: int,
         target_resolution: int,
+        grad_checkpoint: bool = False,
     ) -> ModalityDecoder:
-        return ModalityDecoder(embedding_dim, target_resolution)
+        return ModalityDecoder(embedding_dim, target_resolution, grad_checkpoint)
 
     def _forward_cell_modality_head(
         self,
@@ -1559,7 +1587,11 @@ def compute_loss(
 
 
 def new_metric_stats(device: torch.device) -> torch.Tensor:
-    # n, sum_pred, sum_true, sum_pred2, sum_true2, sum_pred_true, sum_squared_error
+    # n, sum_pred, sum_true, sum_pred2, sum_true2, sum_pred_true, sum_squared_error.
+    # The 7-element running accumulator stays float64 (56 bytes, free) so the
+    # epoch-long sum-of-squares used for Pearson/R2 does not lose precision to
+    # catastrophic cancellation; the per-step element math below runs in float32
+    # to match the fp32 loss and avoid materializing full-size fp64 tensors.
     return torch.zeros(7, dtype=torch.float64, device=device)
 
 
@@ -1569,17 +1601,16 @@ def update_metric_stats(
     pred: torch.Tensor,
     target: torch.Tensor,
 ) -> None:
-    pred = pred.detach().double()
-    target = target.detach().double()
-    diff = pred - target
+    pred = pred.detach().float()
+    target = target.detach().float()
 
     stats[0] += pred.numel()
-    stats[1] += pred.sum()
-    stats[2] += target.sum()
-    stats[3] += pred.square().sum()
-    stats[4] += target.square().sum()
-    stats[5] += (pred * target).sum()
-    stats[6] += diff.square().sum()
+    stats[1] += pred.sum(dtype=torch.float64)
+    stats[2] += target.sum(dtype=torch.float64)
+    stats[3] += pred.square().sum(dtype=torch.float64)
+    stats[4] += target.square().sum(dtype=torch.float64)
+    stats[5] += (pred * target).sum(dtype=torch.float64)
+    stats[6] += (pred - target).square().sum(dtype=torch.float64)
 
 
 def compute_regression_metrics(stats: torch.Tensor) -> dict[str, float]:
@@ -2288,6 +2319,7 @@ def main() -> None:
             cell_types_by_modality,
             cell_embedding_dim=args.cell_embedding_dim,
             target_resolution=args.target_resolution,
+            grad_checkpoint=args.grad_checkpoint,
         ).to(device)
         print_rank0(
             "Cell layers: "
@@ -2401,6 +2433,7 @@ def main() -> None:
             "weight_decay": args.weight_decay,
             "dtype": args.dtype,
             "use_amp": not args.no_amp,
+            "grad_checkpoint": args.grad_checkpoint,
             "augment_rc": args.augment_rc,
             "augment_shift": args.augment_shift,
             "precompute_embeddings": args.precompute_embeddings,
