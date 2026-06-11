@@ -252,6 +252,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--device", default="auto", help="'auto', 'cpu', 'cuda', or e.g. 'cuda:0'")
     parser.add_argument("--dtype", choices=["bfloat16", "float32"], default="bfloat16")
+    parser.add_argument(
+        "--organism-idx",
+        type=int,
+        default=0,
+        help="AlphaGenome organism index used for trunk embeddings. 0=human, 1=mouse.",
+    )
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--wandb", action="store_true", help="Enable W&B logging on rank 0.")
     parser.add_argument("--wandb-project", default="alphagenome-tfr-finetune")
@@ -599,6 +605,34 @@ def create_cell_type_key_map(cell_types_by_modality: dict[str, list[str]]) -> di
     return key_by_cell_type
 
 
+def create_modality_type_key_map(
+    modality_types_by_modality: dict[str, list[str]],
+) -> dict[str, str]:
+    used: set[str] = set()
+    key_by_modality_type = {}
+    for modality_types in modality_types_by_modality.values():
+        for modality_type in modality_types:
+            if modality_type not in key_by_modality_type:
+                safe_name = modality_type.replace("+", "_plus").replace("-", "_minus")
+                key_by_modality_type[modality_type] = _module_key(safe_name, used)
+    return key_by_modality_type
+
+
+def target_row_strand(row: dict[str, str], idx: int) -> str:
+    strand = row.get("strand") if row.get("strand") in ("+", "-") else ""
+    if strand:
+        return strand
+    try:
+        row_index = int(row.get("index", idx))
+        strand_pair = int(row.get("strand_pair", row_index))
+    except (TypeError, ValueError):
+        return ""
+    identifier = row.get("identifier", "")
+    if strand_pair != row_index and identifier.endswith(("+", "-")):
+        return identifier[-1]
+    return ""
+
+
 def cell_types_from_target_rows(
     target_rows_by_modality: dict[str, list[dict[str, str]]],
 ) -> dict[str, list[str]]:
@@ -607,28 +641,33 @@ def cell_types_from_target_rows(
         cell_types = []
         for idx, row in enumerate(rows):
             cell_type = row.get("ct") or row.get("identifier") or f"{modality}_{idx}"
-            strand = row.get("strand") if row.get("strand") in ("+", "-") else ""
-            if not strand:
-                try:
-                    row_index = int(row.get("index", idx))
-                    strand_pair = int(row.get("strand_pair", row_index))
-                except (TypeError, ValueError):
-                    row_index = strand_pair = idx
-                identifier = row.get("identifier", "")
-                if strand_pair != row_index and identifier.endswith(("+", "-")):
-                    strand = identifier[-1]
-            if strand in ("+", "-"):
-                cell_type = f"{cell_type}|strand={strand}"
             cell_types.append(cell_type)
         cell_types_by_modality[modality] = cell_types
     return cell_types_by_modality
 
 
-class CellTypeTrackGroups(nn.Module):
-    """Track-index buffers for one modality, grouped by shared cell type."""
+def modality_types_from_target_rows(
+    target_rows_by_modality: dict[str, list[dict[str, str]]],
+) -> dict[str, list[str]]:
+    modality_types_by_modality = {}
+    for modality, rows in target_rows_by_modality.items():
+        modality_types = []
+        for idx, row in enumerate(rows):
+            strand = target_row_strand(row, idx)
+            modality_types.append(f"{modality}{strand}" if strand else modality)
+        modality_types_by_modality[modality] = modality_types
+    return modality_types_by_modality
 
-    def __init__(self, cell_keys: list[str]):
+
+class CellTypeTrackGroups(nn.Module):
+    """Track-index buffers for one modality, grouped by cell and decoder type."""
+
+    def __init__(self, cell_keys: list[str], modality_keys: list[str]):
         super().__init__()
+        if len(cell_keys) != len(modality_keys):
+            raise ValueError(
+                "cell_keys and modality_keys must have the same number of tracks"
+            )
         self.cell_keys = []
         cell_index_by_key = {}
         for cell_key in dict.fromkeys(cell_keys):
@@ -644,10 +683,22 @@ class CellTypeTrackGroups(nn.Module):
                 torch.tensor(indices, dtype=torch.long),
                 persistent=False,
             )
+        self.modality_keys = list(dict.fromkeys(modality_keys))
+        modality_index_by_key = {
+            modality_key: idx for idx, modality_key in enumerate(self.modality_keys)
+        }
         self.register_buffer(
             "track_cell_indices",
             torch.tensor(
                 [cell_index_by_key[cell_key] for cell_key in cell_keys],
+                dtype=torch.long,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "track_modality_indices",
+            torch.tensor(
+                [modality_index_by_key[modality_key] for modality_key in modality_keys],
                 dtype=torch.long,
             ),
             persistent=False,
@@ -792,6 +843,7 @@ class TFRHeads(nn.Module):
         self,
         heads: dict[str, nn.Module],
         cell_types_by_modality: dict[str, list[str]] | None = None,
+        modality_types_by_modality: dict[str, list[str]] | None = None,
         embedding_dim: int = EMBEDDING_128BP_DIM,
         cell_embedding_dim: int = 16,
         target_resolution: int = 128,
@@ -808,11 +860,23 @@ class TFRHeads(nn.Module):
             )
         self.target_resolution = target_resolution
         self.heads = nn.ModuleDict(heads)
+        if modality_types_by_modality is None:
+            modality_types_by_modality = {}
+        else:
+            modality_types_by_modality = dict(modality_types_by_modality)
+        for modality, head in heads.items():
+            modality_types_by_modality.setdefault(
+                modality,
+                [modality] * head.num_tracks,
+            )
+        self.modality_key_by_type = create_modality_type_key_map(
+            modality_types_by_modality
+        )
         self.modality_layers = nn.ModuleDict({
-            modality: self._create_modality_layer(
+            modality_key: self._create_modality_layer(
                 cell_embedding_dim, target_resolution, grad_checkpoint
             )
-            for modality in heads
+            for modality_key in self.modality_key_by_type.values()
         })
         self.cell_key_by_type = (
             create_cell_type_key_map(cell_types_by_modality)
@@ -836,8 +900,22 @@ class TFRHeads(nn.Module):
                         f"{modality}: got {len(cell_types)} cell types for "
                         f"{n_tracks} tracks"
                     )
+                modality_types = modality_types_by_modality.get(modality)
+                if modality_types is None:
+                    modality_types = [modality] * n_tracks
+                if len(modality_types) != n_tracks:
+                    raise ValueError(
+                        f"{modality}: got {len(modality_types)} modality types for "
+                        f"{n_tracks} tracks"
+                    )
                 cell_keys = [self.cell_key_by_type[cell_type] for cell_type in cell_types]
-                self.track_groups[modality] = CellTypeTrackGroups(cell_keys)
+                modality_keys = [
+                    self.modality_key_by_type[modality_type]
+                    for modality_type in modality_types
+                ]
+                self.track_groups[modality] = CellTypeTrackGroups(
+                    cell_keys, modality_keys
+                )
 
     @staticmethod
     def _create_cell_layer(
@@ -876,7 +954,6 @@ class TFRHeads(nn.Module):
 
         emb = embeddings[128]
         groups = self.track_groups[modality]
-        modality_layer = self.modality_layers[modality]
 
         cell_weights = torch.stack([
             self.cell_layers[cell_key].proj.weight.squeeze(-1)
@@ -899,15 +976,35 @@ class TFRHeads(nn.Module):
                 ENCODER_SKIP_64BP_KEY: embeddings[ENCODER_SKIP_64BP_KEY],
                 ENCODER_SKIP_32BP_KEY: embeddings[ENCODER_SKIP_32BP_KEY],
             }
-        pred_by_cell = modality_layer(
-            cell_embeddings.reshape(batch_size * n_cells, cell_dim, seq_len),
-            encoder_skips=encoder_skips,
-            n_cells=n_cells,
-        )
-        output_len = pred_by_cell.shape[-1]
-        pred_by_cell = pred_by_cell.reshape(batch_size, n_cells, output_len)
 
-        scaled_pred = pred_by_cell[:, groups.track_cell_indices, :]
+        scaled_pred = None
+        for modality_index, modality_key in enumerate(groups.modality_keys):
+            track_indices = torch.nonzero(
+                groups.track_modality_indices == modality_index,
+                as_tuple=False,
+            ).flatten()
+            if track_indices.numel() == 0:
+                continue
+            modality_layer = self.modality_layers[modality_key]
+            pred_by_cell = modality_layer(
+                cell_embeddings.reshape(batch_size * n_cells, cell_dim, seq_len),
+                encoder_skips=encoder_skips,
+                n_cells=n_cells,
+            )
+            output_len = pred_by_cell.shape[-1]
+            pred_by_cell = pred_by_cell.reshape(batch_size, n_cells, output_len)
+            if scaled_pred is None:
+                scaled_pred = pred_by_cell.new_empty(
+                    batch_size,
+                    head.num_tracks,
+                    output_len,
+                )
+            scaled_pred[:, track_indices, :] = pred_by_cell[
+                :, groups.track_cell_indices[track_indices], :
+            ]
+
+        if scaled_pred is None:
+            raise RuntimeError(f"{modality}: no tracks assigned to modality decoders")
         residual_scale = head.residual_scales["128"][organism_idx]
         scaled_pred = F.softplus(scaled_pred) * F.softplus(residual_scale.unsqueeze(2))
 
@@ -1336,7 +1433,12 @@ def precompute_embedding_cache(
                 return
             sequences = torch.stack(sequence_batch, dim=0).to(device, non_blocking=True)
             batch_size = sequences.shape[0]
-            organism_idx = torch.zeros(batch_size, dtype=torch.long, device=device)
+            organism_idx = torch.full(
+                (batch_size,),
+                args.organism_idx,
+                dtype=torch.long,
+                device=device,
+            )
             forward_inputs = compute_embedding_inputs(
                 model,
                 sequences,
@@ -1661,7 +1763,10 @@ def forward_heads(
     requires_grad: bool,
     reverse_complement: torch.Tensor | None = None,
     strand_pair_by_modality: dict[str, torch.Tensor] | None = None,
+    head_organism_idx: torch.Tensor | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    if head_organism_idx is None:
+        head_organism_idx = organism_idx
     if isinstance(inputs, dict):
         input_device = next(iter(inputs.values())).device
         embeddings = {resolution: tensor.detach() for resolution, tensor in inputs.items()}
@@ -1681,7 +1786,7 @@ def forward_heads(
         with amp_context:
             loss_predictions = heads_model(
                 embeddings,
-                organism_idx,
+                head_organism_idx,
                 return_scaled=return_scaled,
             )
 
@@ -1696,7 +1801,7 @@ def forward_heads(
             metric_predictions = {
                 modality: unwrapped_heads.heads[modality].unscale(
                     prediction.detach(),
-                    organism_idx,
+                    head_organism_idx,
                     unwrapped_heads.target_resolution,
                     channels_last=True,
                 )
@@ -1812,7 +1917,13 @@ def run_epoch(
         else:
             model_inputs = sequences.to(device, non_blocking=True)
             batch_size = model_inputs.shape[0]
-        organism_idx = torch.zeros(batch_size, dtype=torch.long, device=device)
+        organism_idx = torch.full(
+            (batch_size,),
+            args.organism_idx,
+            dtype=torch.long,
+            device=device,
+        )
+        head_organism_idx = torch.zeros(batch_size, dtype=torch.long, device=device)
         reverse_complement = None
         if augmentation is not None:
             reverse_complement = augmentation["reverse_complement"].to(
@@ -1831,6 +1942,7 @@ def run_epoch(
             requires_grad=training,
             reverse_complement=reverse_complement,
             strand_pair_by_modality=strand_pair_by_modality,
+            head_organism_idx=head_organism_idx,
         )
         loss = torch.tensor(0.0, device=device)
         loss_by_modality = {}
@@ -1849,7 +1961,7 @@ def run_epoch(
                 target,
                 loss_name=args.loss,
                 head=heads[modality],
-                organism_idx=organism_idx,
+                organism_idx=head_organism_idx,
                 target_resolution=args.target_resolution,
                 positional_weight=args.positional_weight,
                 count_weight=args.count_weight,
@@ -2314,18 +2426,43 @@ def main() -> None:
             modality: train_dataset.target_rows_by_modality[modality]
             for modality in modalities
         })
+        modality_types_by_modality = modality_types_from_target_rows({
+            modality: train_dataset.target_rows_by_modality[modality]
+            for modality in modalities
+        })
+        unique_ct_values = {
+            row["ct"]
+            for rows in train_dataset.target_rows_by_modality.values()
+            for row in rows
+            if row.get("ct")
+        }
+        strand_specific_modality_types = {
+            modality_type
+            for modality_types in modality_types_by_modality.values()
+            for modality_type in modality_types
+            if modality_type.endswith(("+", "-"))
+        }
+        unique_modality_types = {
+            modality_type
+            for modality_types in modality_types_by_modality.values()
+            for modality_type in modality_types
+        }
         heads_model: nn.Module = TFRHeads(
             heads,
             cell_types_by_modality,
+            modality_types_by_modality,
             cell_embedding_dim=args.cell_embedding_dim,
             target_resolution=args.target_resolution,
             grad_checkpoint=args.grad_checkpoint,
         ).to(device)
         print_rank0(
             "Cell layers: "
-            f"{len(unwrap_heads(heads_model).cell_layers)} shared ct transforms; "
-            f"cell_embedding_dim={args.cell_embedding_dim}; "
-            f"modality layers={len(unwrap_heads(heads_model).modality_layers)}",
+            f"{len(unwrap_heads(heads_model).cell_layers)} shared ct transforms "
+            f"({len(unique_ct_values)} unique ct values); "
+            f"modality layers={len(unwrap_heads(heads_model).modality_layers)} "
+            f"({len(unique_modality_types)} track modality types; "
+            f"{len(strand_specific_modality_types)} strand-specific); "
+            f"cell_embedding_dim={args.cell_embedding_dim}",
             rank,
         )
         if world_size > 1:
@@ -2398,6 +2535,7 @@ def main() -> None:
                 for modality in modalities
             },
             "cell_types": cell_types_by_modality,
+            "modality_types": modality_types_by_modality,
             "n_cell_types": len(unwrap_heads(heads_model).cell_layers),
             "cell_embedding_dim": args.cell_embedding_dim,
             "n_modality_layers": len(unwrap_heads(heads_model).modality_layers),
@@ -2411,6 +2549,7 @@ def main() -> None:
             "crop_bins_128bp": train_dataset.prediction_crop_128bp,
             "target_length_128bp": train_dataset.output_length_128bp,
             "loss": args.loss,
+            "organism_idx": args.organism_idx,
             "pretrained_weights": str(pretrained_weights),
             "pretrained_weights_source": (
                 "local" if pretrained_weights_arg is not None else "huggingface"

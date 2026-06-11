@@ -33,6 +33,7 @@ from scripts.finetune_tfr_heads import (
     cell_types_from_target_rows,
     embedding_cache_file_manifest_path,
     forward_heads,
+    modality_types_from_target_rows,
     new_metric_stats,
     switch_reverse_predictions,
     update_metric_stats,
@@ -129,7 +130,7 @@ def test_cell_types_from_target_rows_uses_ct_with_identifier_fallback():
     }
 
 
-def test_cell_types_from_target_rows_keeps_stranded_tracks_distinct():
+def test_target_row_helpers_put_strand_on_modality_not_cell_type():
     rows = {
         "RNA": [
             {"index": "0", "identifier": "cell+", "ct": "cell", "strand_pair": "1"},
@@ -139,7 +140,10 @@ def test_cell_types_from_target_rows_keeps_stranded_tracks_distinct():
     }
 
     assert cell_types_from_target_rows(rows) == {
-        "RNA": ["cell|strand=+", "cell|strand=-", "bulk"],
+        "RNA": ["cell", "cell", "bulk"],
+    }
+    assert modality_types_from_target_rows(rows) == {
+        "RNA": ["RNA+", "RNA-", "RNA"],
     }
 
 
@@ -188,6 +192,39 @@ def test_tfr_heads_shares_cell_layers_across_modalities():
 
     assert outputs["ATAC"].shape == (2, 3, 2)
     assert outputs["RNA"].shape == (2, 3, 1)
+
+
+def test_tfr_heads_uses_strand_specific_modality_layers_for_shared_rna_cell():
+    heads = {
+        "RNA": GenomeTracksHead(
+            in_channels={128: 4},
+            num_tracks=2,
+            resolutions=(128,),
+            num_organisms=1,
+            apply_squashing=True,
+        ),
+    }
+    model = TFRHeads(
+        heads,
+        cell_types_by_modality={"RNA": ["shared_ct", "shared_ct"]},
+        modality_types_by_modality={"RNA": ["RNA+", "RNA-"]},
+        embedding_dim=4,
+        cell_embedding_dim=2,
+    )
+
+    assert len(model.cell_layers) == 1
+    assert len(model.modality_layers) == 2
+    assert set(model.modality_key_by_type) == {"RNA+", "RNA-"}
+    shared_key = model.cell_key_by_type["shared_ct"]
+    assert model.track_groups["RNA"].cell_keys == [shared_key]
+    assert len(model.track_groups["RNA"].modality_keys) == 2
+
+    embeddings = {128: torch.randn(2, 4, 3)}
+    organism_idx = torch.zeros(2, dtype=torch.long)
+
+    outputs = model(embeddings, organism_idx, return_scaled=True)
+
+    assert outputs["RNA"].shape == (2, 3, 2)
 
 
 def test_tfr_heads_32bp_unet_upsamples_fourfold():

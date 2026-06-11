@@ -35,6 +35,7 @@ try:
         create_tfr_dataset,
         forward_heads,
         is_main_process,
+        modality_types_from_target_rows,
         setup_torchrun,
         unpack_tfr_batch,
     )
@@ -48,6 +49,7 @@ except ModuleNotFoundError:
         create_tfr_dataset,
         forward_heads,
         is_main_process,
+        modality_types_from_target_rows,
         setup_torchrun,
         unpack_tfr_batch,
     )
@@ -107,6 +109,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--crop-bins", type=int, default=None)
     parser.add_argument("--device", default="auto", help="'auto', 'cpu', 'cuda', or e.g. 'cuda:0'")
     parser.add_argument("--dtype", choices=["bfloat16", "float32"], default=None)
+    parser.add_argument(
+        "--organism-idx",
+        type=int,
+        default=None,
+        help="AlphaGenome organism index for trunk/head forwarding. Defaults to checkpoint metadata, then 0.",
+    )
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--quiet", action="store_true", help="Disable progress bars.")
     return parser.parse_args()
@@ -195,6 +203,16 @@ def create_heads_model(
         }
     else:
         cell_types_by_modality = {}
+    metadata_modality_types = metadata.get("modality_types")
+    has_metadata_modality_types = isinstance(metadata_modality_types, dict)
+    if isinstance(metadata_modality_types, dict):
+        modality_types_by_modality = {
+            modality: list(metadata_modality_types[modality])
+            for modality in modalities
+            if modality in metadata_modality_types
+        }
+    else:
+        modality_types_by_modality = {}
     missing_modalities = [
         modality for modality in modalities if modality not in cell_types_by_modality
     ]
@@ -204,10 +222,24 @@ def create_heads_model(
             for modality in missing_modalities
         })
         cell_types_by_modality.update(reconstructed)
+    missing_modality_types = []
+    if has_metadata_modality_types or not isinstance(metadata_cell_types, dict):
+        missing_modality_types = [
+            modality
+            for modality in modalities
+            if modality not in modality_types_by_modality
+        ]
+    if missing_modality_types:
+        reconstructed = modality_types_from_target_rows({
+            modality: dataset.target_rows_by_modality[modality]
+            for modality in missing_modality_types
+        })
+        modality_types_by_modality.update(reconstructed)
 
     heads_model = TFRHeads(
         heads,
         cell_types_by_modality,
+        modality_types_by_modality,
         cell_embedding_dim=int(metadata.get("cell_embedding_dim", 16)),
         target_resolution=target_resolution,
     ).to(device)
@@ -412,7 +444,13 @@ def evaluate(
             raise RuntimeError("Local loader is exhausted but distributed batch check passed")
 
         sequences = sequences.to(device, non_blocking=True)
-        organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
+        organism_idx = torch.full(
+            (sequences.shape[0],),
+            args.organism_idx,
+            dtype=torch.long,
+            device=device,
+        )
+        head_organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
         reverse_complement = None
         if augmentation is not None:
             reverse_complement = augmentation["reverse_complement"].to(
@@ -431,6 +469,7 @@ def evaluate(
             requires_grad=False,
             reverse_complement=reverse_complement,
             strand_pair_by_modality=strand_pair_by_modality,
+            head_organism_idx=head_organism_idx,
         )
 
         batch_loss = torch.tensor(0.0, device=device)
@@ -447,7 +486,8 @@ def evaluate(
                 target,
                 loss_name=args.loss,
                 head=heads[modality],
-                organism_idx=organism_idx,
+                organism_idx=head_organism_idx,
+                target_resolution=target_resolution,
                 positional_weight=eval_args.positional_weight,
                 count_weight=eval_args.count_weight,
             )
@@ -601,6 +641,8 @@ def main() -> None:
         args.batch_size = int(metadata.get("batch_size", 1))
     if args.dtype is None:
         args.dtype = metadata.get("dtype", "bfloat16")
+    if args.organism_idx is None:
+        args.organism_idx = int(metadata.get("organism_idx", 0))
     if not args.no_amp and metadata.get("use_amp") is False:
         args.no_amp = True
 
