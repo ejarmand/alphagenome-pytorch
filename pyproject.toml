@@ -15,6 +15,9 @@ dependencies = [
     "huggingface_hub",
 ]
 
+[project.scripts]
+agt = "alphagenome_pytorch.cli:main"
+
 [project.optional-dependencies]
 test = [
     "pytest>=7.0.0",
@@ -57,6 +60,12 @@ scoring = [
     "pyranges",
     "alphagenome",
 ]
+serving = [
+    "grpcio",
+    "pandas",
+    "pyfaidx",
+    "alphagenome",
+]
 docs = [
     "sphinx>=7.0.0",
     "sphinx-book-theme",
@@ -73,6 +82,7 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = ["-v", "--strict-markers"]
+
 markers = [
     "unit: Unit tests (no external dependencies)",
     "integration: Integration tests with full model (PyTorch only, no JAX required)",
@@ -86,6 +96,11 @@ markers = [
 
 [tool.hatch.version]
 source = "vcs"
+
+[tool.hatch.build]
+artifacts = [
+    "src/alphagenome_pytorch/data/*.parquet",
+]
 
 [tool.hatch.build.hooks.vcs]
 version-file = "src/alphagenome_pytorch/_version.py"
