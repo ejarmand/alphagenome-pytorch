@@ -39,6 +39,7 @@ from alphagenome_pytorch import AlphaGenome  # noqa: E402
 from alphagenome_pytorch.config import DtypePolicy  # noqa: E402
 from alphagenome_pytorch.extensions.finetuning.heads import create_finetuning_head  # noqa: E402
 from alphagenome_pytorch.extensions.finetuning.transfer import load_trunk, remove_all_heads  # noqa: E402
+from alphagenome_pytorch.utils.sequence import reverse_complement_onehot_tensor  # noqa: E402
 from finetune_tfr_heads import TFRHeads, forward_heads  # noqa: E402
 
 
@@ -101,6 +102,15 @@ def parse_args() -> argparse.Namespace:
         help="Dataset name under scores/{modality}/.",
     )
     parser.add_argument("--signed", action="store_true", help="Write signed LFC instead of abs(LFC).")
+    parser.add_argument(
+        "--no-rc-average",
+        action="store_true",
+        help=(
+            "Disable reverse-complement test-time averaging. By default, the "
+            "script averages forward predictions with reverse-complement "
+            "predictions switched back through metadata['strand_pair']."
+        ),
+    )
     parser.add_argument(
         "--json-out",
         type=Path,
@@ -409,6 +419,78 @@ def create_heads_model(
     return heads_model
 
 
+def create_strand_pair_tensors(
+    metadata: dict,
+    modalities: list[str],
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    strand_pair_metadata = metadata.get("strand_pair", {})
+    strand_pair_by_modality = {}
+    for modality in modalities:
+        n_tracks = int(metadata["n_tracks"][modality])
+        strand_pair = strand_pair_metadata.get(modality)
+        if strand_pair is None:
+            strand_pair = list(range(n_tracks))
+        if len(strand_pair) != n_tracks:
+            raise ValueError(
+                f"{modality}: strand_pair has {len(strand_pair)} entries, "
+                f"expected {n_tracks}"
+            )
+        strand_pair_by_modality[modality] = torch.as_tensor(
+            strand_pair,
+            dtype=torch.long,
+            device=device,
+        )
+    return strand_pair_by_modality
+
+
+def predict_heads_with_optional_rc_average(
+    model: torch.nn.Module,
+    heads_model: TFRHeads,
+    sequences: torch.Tensor,
+    organism_idx: torch.Tensor,
+    crop_bins: int,
+    use_amp: bool,
+    strand_pair_by_modality: dict[str, torch.Tensor],
+    rc_average: bool,
+) -> dict[str, torch.Tensor]:
+    _loss_fwd, pred_fwd = forward_heads(
+        model,
+        heads_model,
+        sequences,
+        organism_idx,
+        crop_bins,
+        use_amp=use_amp,
+        return_scaled=False,
+        requires_grad=False,
+    )
+    if not rc_average:
+        return pred_fwd
+
+    rc_sequences = reverse_complement_onehot_tensor(sequences)
+    reverse_complement = torch.ones(
+        sequences.shape[0],
+        dtype=torch.bool,
+        device=sequences.device,
+    )
+    _loss_rc, pred_rc = forward_heads(
+        model,
+        heads_model,
+        rc_sequences,
+        organism_idx,
+        crop_bins,
+        use_amp=use_amp,
+        return_scaled=False,
+        requires_grad=False,
+        reverse_complement=reverse_complement,
+        strand_pair_by_modality=strand_pair_by_modality,
+    )
+    return {
+        modality: (pred_fwd[modality] + pred_rc[modality]) * 0.5
+        for modality in pred_fwd
+    }
+
+
 def write_variant_group(h5: h5py.File, variants: list[VcfVariant], chrom_key: str) -> None:
     group = h5.create_group("variants")
     string_dtype = h5py.string_dtype("utf-8")
@@ -488,6 +570,8 @@ def main() -> None:
         param.requires_grad = False
 
     heads_model = create_heads_model(checkpoint, metadata, modalities, device)
+    strand_pair_by_modality = create_strand_pair_tensors(metadata, modalities, device)
+    rc_average = not args.no_rc_average
 
     target_resolution = int(metadata["target_resolution"])
     crop_bins = int(metadata.get("crop_bins", 0))
@@ -567,25 +651,25 @@ def main() -> None:
             ).unsqueeze(0)
 
             with torch.no_grad():
-                _loss_ref, pred_ref = forward_heads(
+                pred_ref = predict_heads_with_optional_rc_average(
                     model,
                     heads_model,
                     ref,
                     organism_idx,
                     crop_bins,
                     use_amp=args.dtype == "mixed",
-                    return_scaled=False,
-                    requires_grad=False,
+                    strand_pair_by_modality=strand_pair_by_modality,
+                    rc_average=rc_average,
                 )
-                _loss_alt, pred_alt = forward_heads(
+                pred_alt = predict_heads_with_optional_rc_average(
                     model,
                     heads_model,
                     alt,
                     organism_idx,
                     crop_bins,
                     use_amp=args.dtype == "mixed",
-                    return_scaled=False,
-                    requires_grad=False,
+                    strand_pair_by_modality=strand_pair_by_modality,
+                    rc_average=rc_average,
                 )
 
             for modality in modalities:
@@ -605,6 +689,7 @@ def main() -> None:
         h5.attrs["target_resolution"] = target_resolution
         h5.attrs["crop_bins"] = crop_bins
         h5.attrs["context_length"] = context_length
+        h5.attrs["rc_average"] = rc_average
         write_variant_group(h5, variants, chrom_key="chrom")
         for modality, arr in scores.items():
             h5.create_dataset(

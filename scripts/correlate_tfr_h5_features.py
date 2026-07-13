@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import types
 from pathlib import Path
@@ -28,10 +29,17 @@ if str(EVAL_UTILS_SRC) not in sys.path:
 sys.modules.setdefault("pyBigWig", types.ModuleType("pyBigWig"))
 from eval_utils.eval.utils import coefficient_of_variation, vectorized_pearson_correlation
 from eval_utils.seq5.class_module import _construct_chrom_intervals, _sorted_overlap_ids
+from eval_utils.utils.mouse_brain_atlas import get_cell_class
 
 
 DEFAULT_PEAKS = REPO_ROOT / "baskerville_dnn" / "data" / "ref" / "peak_locs.bed"
-DEFAULT_GENES = REPO_ROOT / "baskerville_dnn" / "data" / "genes.bed"
+DEFAULT_GTF = REPO_ROOT / "baskerville_dnn" / "data" / "ref" / "gtf" / "mm10.refGene.gtf"
+DEFAULT_TARGET_METADATA = (
+    REPO_ROOT / "baskerville_dnn" / "out" / "datasets" / "mouse_fixed_borzoi_contig" / "targets.txt"
+)
+DEFAULT_CELL_COUNTS = (
+    REPO_ROOT / "baskerville_dnn" / "data" / "ref" / "cell_info" / "cell_ns_by_mod.tsv"
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -48,8 +56,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--targets-h5", type=Path, default=None)
     parser.add_argument("--data-dir", type=Path, default=None)
     parser.add_argument("--acc", type=Path, default=None, help="Track acc.txt from eval output.")
+    parser.add_argument(
+        "--target-metadata",
+        type=Path,
+        default=DEFAULT_TARGET_METADATA,
+        help="Informative targets.txt used to enrich the eval target table before filtering.",
+    )
+    parser.add_argument(
+        "--filter-like-eval-nov",
+        action="store_true",
+        help="Apply eval_nov.ipynb use_info track filtering before cross-cell correlations.",
+    )
+    parser.add_argument(
+        "--cell-counts",
+        type=Path,
+        default=DEFAULT_CELL_COUNTS,
+        help="cell_ns_by_mod.tsv fallback when targets.txt lacks cell_n.",
+    )
     parser.add_argument("--peaks", type=Path, default=DEFAULT_PEAKS)
-    parser.add_argument("--genes", type=Path, default=DEFAULT_GENES)
+    parser.add_argument(
+        "--genes",
+        type=Path,
+        default=None,
+        help="Gene BED override. Defaults to genes derived from --gtf.",
+    )
+    parser.add_argument(
+        "--gtf",
+        type=Path,
+        default=DEFAULT_GTF,
+        help="GTF used to derive default gene intervals; matches eval_nov.ipynb.",
+    )
     parser.add_argument("--split", default="test")
     parser.add_argument("--peak-min-overlap", type=float, default=498)
     parser.add_argument("--gene-min-coverage", type=float, default=0.99)
@@ -315,8 +351,8 @@ class H5FeatureExtractor:
         )
 
 
-def read_acc_or_targets(acc_path: Path | None, data_dir: Path) -> pd.DataFrame:
-    path = acc_path if acc_path is not None and acc_path.exists() else data_dir / "targets.txt"
+def read_tracks(data_dir: Path) -> pd.DataFrame:
+    path = data_dir / "targets.txt"
     tracks = pd.read_csv(path, sep="\t")
     if "identifier" not in tracks.columns:
         raise ValueError(f"{path} must contain an identifier column")
@@ -326,6 +362,49 @@ def read_acc_or_targets(acc_path: Path | None, data_dir: Path) -> pd.DataFrame:
     if "index" not in tracks.columns:
         tracks["index"] = np.arange(len(tracks))
     return tracks
+
+
+def target_metadata_key(identifier: object) -> str:
+    key = str(identifier)
+    if key.endswith(("+", "-")):
+        key = key[:-1]
+    return key
+
+
+def enrich_tracks_from_metadata(tracks: pd.DataFrame, metadata_path: Path | None) -> pd.DataFrame:
+    if metadata_path is None or not metadata_path.exists():
+        return tracks
+    metadata = pd.read_csv(metadata_path, sep="\t")
+    if "identifier" not in metadata.columns:
+        return tracks
+    enrich_cols = [
+        col
+        for col in ["cell_class", "subclass", "cell_n", "subclass_name"]
+        if col in metadata.columns
+    ]
+    if not enrich_cols:
+        return tracks
+    metadata = metadata[["identifier", *enrich_cols]].copy()
+    metadata["_metadata_key"] = metadata["identifier"].map(target_metadata_key)
+    metadata = metadata.drop_duplicates("_metadata_key", keep="first").set_index("_metadata_key")
+    enriched = tracks.copy()
+    keys = enriched["identifier"].map(target_metadata_key)
+    for col in enrich_cols:
+        mapped = keys.map(metadata[col])
+        if col not in enriched.columns:
+            enriched[col] = mapped
+        else:
+            enriched[col] = enriched[col].where(enriched[col].notna(), mapped)
+    return enriched
+
+
+def read_acc(acc_path: Path | None) -> pd.DataFrame | None:
+    if acc_path is None or not acc_path.exists():
+        return None
+    acc = pd.read_csv(acc_path, sep="\t")
+    if "identifier" not in acc.columns:
+        return None
+    return acc
 
 
 def target_tracks_for_h5(
@@ -348,6 +427,92 @@ def target_tracks_for_h5(
     return pd.concat(pieces, axis=0, ignore_index=True)
 
 
+def normalize_cell_key(value: object) -> str:
+    key = str(value)
+    if "/" in key:
+        key = key.rsplit("/", 1)[-1]
+    key = key.split(".bw", 1)[0]
+    key = key.replace(".CGN", "").replace(".CHN", "").replace(".ATAC", "")
+    key = key.replace("_rna_forward", "").replace("_rna_reverse", "")
+    if len(key) > 4 and key[:3].isdigit() and key[3] in "_-":
+        key = key[4:]
+    return key.replace("-", "_").replace(".", "_")
+
+
+def fill_cell_n_from_counts(tracks: pd.DataFrame, cell_counts_path: Path) -> pd.DataFrame:
+    if "cell_n" in tracks.columns and tracks["cell_n"].notna().any():
+        return tracks
+    tracks = tracks.copy()
+    tracks["cell_n"] = np.nan
+    if not cell_counts_path.exists():
+        return tracks
+    counts = pd.read_csv(cell_counts_path, sep="\t")
+    if "access_name" not in counts.columns:
+        return tracks
+    count_lookup = counts.set_index(counts["access_name"].map(normalize_cell_key))
+    modality_map = {"CGN": "MC", "CHN": "m3c"}
+    for idx, row in tracks.iterrows():
+        key = normalize_cell_key(row.get("ct", row.get("identifier", "")))
+        modality = str(row.get("modality", ""))
+        count_col = modality_map.get(modality, modality)
+        if key in count_lookup.index and count_col in count_lookup.columns:
+            tracks.at[idx, "cell_n"] = count_lookup.loc[key, count_col]
+    return tracks
+
+
+def apply_eval_nov_filter(
+    tracks: pd.DataFrame,
+    acc: pd.DataFrame | None,
+    cell_counts_path: Path,
+) -> pd.DataFrame:
+    """Reproduce the final eval_nov.ipynb use_info track filter."""
+    info = tracks.copy()
+    if acc is not None:
+        keep_cols = [col for col in ["identifier", "pearsonr"] if col in acc.columns]
+        info = info.merge(acc[keep_cols], on="identifier", how="left", suffixes=("", "_acc"))
+    elif "pearsonr" not in info.columns:
+        info["pearsonr"] = 0.0
+
+    if "fsize" not in info.columns:
+        raise ValueError("--filter-like-eval-nov requires fsize in targets.txt")
+    info["log_fsize"] = np.log10(pd.to_numeric(info["fsize"], errors="coerce"))
+    info = fill_cell_n_from_counts(info, cell_counts_path)
+    info["log_cell_n"] = np.log10(pd.to_numeric(info["cell_n"], errors="coerce"))
+    if "cell_class" not in info.columns:
+        info["cell_class"] = info["identifier"].map(get_cell_class)
+    if "ct" not in info.columns:
+        info["ct"] = info["identifier"].map(normalize_cell_key)
+    if "strand" not in info.columns:
+        info["strand"] = ""
+    info["strand"] = info["strand"].fillna("").astype(str)
+    info["stranded_"] = np.where(info["modality"] == "RNA", "RNA" + info["strand"].astype(str), info["modality"])
+
+    info = info.loc[
+        ~((info["modality"] == "CHN") & info["cell_class"].isin(["NN", "IMN", "Imn"]))
+    ].copy()
+
+    rna_filter1 = info.loc[(info["stranded_"] == "RNA+") & (info["log_fsize"] < 6.9), "ct"]
+    bad_rna = (info["modality"] == "RNA") & info["ct"].isin(rna_filter1)
+    bad_9me3 = (info["modality"] == "H3K9me3") & (info["log_cell_n"] < 3)
+    bad_4me1 = (info["modality"] == "H3K4me1") & (info["log_cell_n"] < 3)
+    bad_k27ac = (info["modality"] == "H3K27ac") & (info["log_cell_n"] < 3)
+    bad_k27me = (info["modality"] == "H3K27me3") & (info["log_cell_n"] < 3)
+    bad_ch = (info["modality"] == "CHN") & (info["log_fsize"] < 9.5)
+    bad_mc = (info["modality"] == "CGN") & (info["log_fsize"] < 8.75)
+    to_drop = info["pearsonr"].isna()
+    for drop in [bad_9me3, bad_4me1, bad_k27ac, bad_k27me, bad_mc, bad_rna, bad_ch]:
+        to_drop = to_drop | drop.fillna(False)
+
+    filtered = info.loc[~to_drop].copy()
+    print(
+        "eval_nov filter kept "
+        f"{len(filtered)}/{len(info)} tracks: "
+        + ", ".join(f"{k}={v}" for k, v in filtered["modality"].value_counts().sort_index().items()),
+        flush=True,
+    )
+    return filtered
+
+
 def read_bed(path: Path, has_strand: bool) -> pd.DataFrame:
     usecols = [0, 1, 2, 3, 5] if has_strand else [0, 1, 2]
     names = ["chrom", "start", "end", "name", "strand"] if has_strand else ["chrom", "start", "end"]
@@ -359,6 +524,44 @@ def read_bed(path: Path, has_strand: bool) -> pd.DataFrame:
             bed["chrom"].astype(str) + "_" + bed["start"].astype(str) + "_" + bed["end"].astype(str)
         )
     return bed
+
+
+def read_genes_from_gtf(path: Path) -> pd.DataFrame:
+    """Read first transcript per gene_id from the eval_nov GTF as BED-like intervals."""
+    attr_re = re.compile(r'(\S+) "([^"]+)"')
+    rows = []
+    seen_gene_ids = set()
+    with path.open() as gtf_file:
+        for line in gtf_file:
+            if not line.strip() or line.startswith("#"):
+                continue
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) < 9 or fields[2] != "transcript":
+                continue
+            attrs = dict(attr_re.findall(fields[8]))
+            gene_id = attrs.get("gene_id")
+            if gene_id is None or gene_id in seen_gene_ids:
+                continue
+            seen_gene_ids.add(gene_id)
+            rows.append(
+                {
+                    "chrom": fields[0],
+                    "start": int(fields[3]) - 1,
+                    "end": int(fields[4]),
+                    "name": attrs.get("gene_name", gene_id),
+                    "strand": fields[6],
+                    "gene_id": gene_id,
+                }
+            )
+    if not rows:
+        raise ValueError(f"No transcript records found in {path}")
+    return pd.DataFrame(rows)
+
+
+def read_gene_features(genes_path: Path | None, gtf_path: Path) -> pd.DataFrame:
+    if genes_path is not None:
+        return read_bed(genes_path, has_strand=True)
+    return read_genes_from_gtf(gtf_path)
 
 
 def iter_chunks(df: pd.DataFrame, chunk_size: int) -> Iterable[pd.DataFrame]:
@@ -455,11 +658,13 @@ def long_correlations(
 
 
 def write_summary(correlations: pd.DataFrame, path: Path) -> None:
+    correlations = correlations.copy()
+    correlations["pearsonr"] = pd.to_numeric(correlations["pearsonr"], errors="coerce")
     summary = (
         correlations.groupby("modality", sort=False)
         .agg(
             n=("pearsonr", "size"),
-            n_finite=("pearsonr", lambda x: np.isfinite(x).sum()),
+            n_finite=("pearsonr", lambda x: np.isfinite(x.to_numpy(dtype=float)).sum()),
             mean_pearsonr=("pearsonr", "mean"),
             median_pearsonr=("pearsonr", "median"),
         )
@@ -589,7 +794,14 @@ def main() -> None:
         n_tracks_by_modality = {
             modality: n_tracks_by_modality[modality] for modality in modalities
         }
-    tracks = target_tracks_for_h5(read_acc_or_targets(args.acc, data_dir), modalities, n_tracks_by_modality)
+    acc_path = args.acc or default_eval_file(args.model_dir, "acc.txt")
+    tracks = target_tracks_for_h5(
+        enrich_tracks_from_metadata(read_tracks(data_dir), args.target_metadata),
+        modalities,
+        n_tracks_by_modality,
+    )
+    if args.filter_like_eval_nov:
+        tracks = apply_eval_nov_filter(tracks, read_acc(acc_path), args.cell_counts)
 
     target_data = H5FeatureExtractor(data_dir=data_dir, h5_path=targets_h5, data_key="targets", split=args.split)
     pred_data = H5FeatureExtractor(data_dir=data_dir, h5_path=preds_h5, data_key="preds", split=args.split)
@@ -608,7 +820,7 @@ def main() -> None:
             args.peak_chunk_size,
         )
     if not args.skip_genes:
-        genes = read_bed(args.genes, has_strand=True)
+        genes = read_gene_features(args.genes, args.gtf)
         if args.max_genes is not None:
             genes = genes.head(args.max_genes)
         compute_gene_correlations(

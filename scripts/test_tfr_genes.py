@@ -314,10 +314,48 @@ def strand_output_rows(targets_df: pd.DataFrame, *, flip_strand: bool) -> pd.Dat
     return targets_df[targets_df.get("strand", "") != drop_strand].reset_index(drop=True)
 
 
-def strand_mask(targets_df: pd.DataFrame, gene_strand: str, *, flip_strand: bool) -> np.ndarray:
-    if (gene_strand == "+") ^ flip_strand:
-        return (targets_df.get("strand", "") != "-").to_numpy()
-    return (targets_df.get("strand", "") != "+").to_numpy()
+def target_row_index(row: pd.Series, fallback: int) -> int:
+    try:
+        return int(row.get("index", row.get("global_index", fallback)))
+    except (TypeError, ValueError):
+        return int(row.get("global_index", fallback))
+
+
+def target_row_strand(row: pd.Series) -> str:
+    strand = row.get("strand", "")
+    return strand if strand in ("+", "-") else ""
+
+
+def strand_column_indices(
+    targets_df: pd.DataFrame,
+    output_targets_df: pd.DataFrame,
+    gene_strand: str,
+    *,
+    flip_strand: bool,
+) -> np.ndarray:
+    """Map collapsed output targets to the source strand columns for a gene."""
+    desired_strand = "+" if (gene_strand == "+") ^ flip_strand else "-"
+    index_to_position = {
+        target_row_index(row, row_i): row_i
+        for row_i, row in targets_df.reset_index(drop=True).iterrows()
+    }
+    positions = []
+    for output_i, row in output_targets_df.reset_index(drop=True).iterrows():
+        source_position = int(row.get("global_index", output_i))
+        row_strand = target_row_strand(row)
+        if row_strand and row_strand != desired_strand:
+            try:
+                pair_index = int(row.get("strand_pair"))
+            except (TypeError, ValueError):
+                pair_index = target_row_index(row, source_position)
+            if pair_index not in index_to_position:
+                identifier = row.get("identifier", f"target {output_i}")
+                raise ValueError(
+                    f"{identifier}: strand_pair={pair_index} is missing from evaluated targets"
+                )
+            source_position = index_to_position[pair_index]
+        positions.append(source_position)
+    return np.asarray(positions, dtype=np.int64)
 
 
 def finite_pearson(x: np.ndarray, y: np.ndarray) -> float:
@@ -478,13 +516,25 @@ def compute_gene_tables(
     gene_targets = []
     gene_within = []
     gene_wvar = []
+    column_indices_by_strand = {
+        strand: strand_column_indices(
+            targets_df,
+            output_targets_df,
+            strand,
+            flip_strand=args.flip_strand,
+        )
+        for strand in ("+", "-")
+    }
 
     for gene_id in gene_ids:
         preds = np.concatenate(gene_preds_dict[gene_id], axis=0).astype("float32")
         targets = np.concatenate(gene_targets_dict[gene_id], axis=0).astype("float32")
-        mask = strand_mask(targets_df, gene_strands.get(gene_id, "+"), flip_strand=args.flip_strand)
-        preds = preds[:, mask]
-        targets = targets[:, mask]
+        column_indices = column_indices_by_strand.get(
+            gene_strands.get(gene_id, "+"),
+            column_indices_by_strand["+"],
+        )
+        preds = preds[:, column_indices]
+        targets = targets[:, column_indices]
         if preds.shape[1] != n_targets:
             raise ValueError(
                 f"{gene_id}: stranded target count {preds.shape[1]} does not match "

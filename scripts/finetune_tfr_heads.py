@@ -371,8 +371,22 @@ def collate_tfr_cached_embeddings(
                 dtype=torch.long,
             ),
         }
+        if "input_reverse_complement" in batch[0][2]:
+            augmentation["input_reverse_complement"] = torch.tensor(
+                [bool(item[2]["input_reverse_complement"]) for item in batch],
+                dtype=torch.bool,
+            )
         return embeddings, targets, augmentation
     return embeddings, targets
+
+
+def reverse_complement_targets(
+    targets: torch.Tensor,
+    strand_pair: torch.Tensor | np.ndarray,
+) -> torch.Tensor:
+    """Reverse target bins and swap stranded channels into RC target order."""
+    pair = torch.as_tensor(strand_pair, dtype=torch.long)
+    return torch.flip(targets, dims=[1]).index_select(-1, pair)
 
 
 class CachedEmbeddingTFRecordDataset(IterableDataset):
@@ -497,6 +511,7 @@ class CachedEmbeddingTFRecordDataset(IterableDataset):
             skip_32_forward = chunk.get("encoder_skip_forward_32bp")
             skip_32_reverse = chunk.get("encoder_skip_reverse_32bp")
             targets_by_modality = chunk["targets"]
+            reverse_targets_by_modality = chunk.get("targets_reverse")
             for sample_idx in range(embeddings_forward.shape[0]):
                 reverse_complement = self.augment_rc and rng.random() > 0.5
                 embeddings = {
@@ -518,15 +533,24 @@ class CachedEmbeddingTFRecordDataset(IterableDataset):
                         if reverse_complement
                         else skip_32_forward[sample_idx]
                     )
+                selected_targets_by_modality = targets_by_modality
+                switch_predictions = reverse_complement
+                if reverse_complement and reverse_targets_by_modality is not None:
+                    selected_targets_by_modality = reverse_targets_by_modality
+                    switch_predictions = False
                 targets = {
                     modality: {target_resolution: targets[target_resolution][sample_idx]}
-                    for modality, targets in targets_by_modality.items()
+                    for modality, targets in selected_targets_by_modality.items()
                 }
                 if self.augment_rc:
                     yield (
                         embeddings,
                         targets,
-                        {"reverse_complement": reverse_complement, "shift": 0},
+                        {
+                            "reverse_complement": switch_predictions,
+                            "input_reverse_complement": reverse_complement,
+                            "shift": 0,
+                        },
                     )
                 else:
                     yield embeddings, targets
@@ -1150,7 +1174,7 @@ def embedding_cache_expected_metadata(
     split: str,
 ) -> dict[str, Any]:
     return {
-        "format_version": 2,
+        "format_version": 3,
         "split": split,
         "data_dir": str(args.data_dir.resolve()),
         "pretrained_weights": (
@@ -1164,6 +1188,7 @@ def embedding_cache_expected_metadata(
         "encoder_skips": args.target_resolution == 32,
         "model_dtype": args.dtype,
         "embedding_cache_dtype": args.embedding_cache_dtype,
+        "target_cache": "forward_and_reverse_complement",
         "seq_length": dataset.metadata.seq_length,
         "target_length": dataset.metadata.target_length,
         "output_length": dataset.output_length,
@@ -1364,6 +1389,10 @@ def precompute_embedding_cache(
             modality: []
             for modality in dataset.modalities
         }
+        pending_targets_reverse: dict[str, list[torch.Tensor]] = {
+            modality: []
+            for modality in dataset.modalities
+        }
         sequence_batch: list[torch.Tensor] = []
         target_batch: dict[str, list[torch.Tensor]] = {
             modality: []
@@ -1388,6 +1417,10 @@ def precompute_embedding_cache(
                 modality: {target_resolution: torch.cat(parts, dim=0)}
                 for modality, parts in pending_targets.items()
             }
+            targets_reverse = {
+                modality: {target_resolution: torch.cat(parts, dim=0)}
+                for modality, parts in pending_targets_reverse.items()
+            }
             chunk_name = (
                 f"{split}.file{file_idx:05d}.chunk{chunk_idx:06d}.pt"
             )
@@ -1395,6 +1428,7 @@ def precompute_embedding_cache(
                 "embeddings_forward_128bp": embeddings_forward,
                 "embeddings_reverse_128bp": embeddings_reverse,
                 "targets": targets,
+                "targets_reverse": targets_reverse,
             }
             if include_encoder_skips:
                 chunk_payload.update({
@@ -1426,6 +1460,8 @@ def precompute_embedding_cache(
             for parts in pending_reverse.values():
                 parts.clear()
             for parts in pending_targets.values():
+                parts.clear()
+            for parts in pending_targets_reverse.values():
                 parts.clear()
 
         def flush_model_batch() -> None:
@@ -1459,8 +1495,13 @@ def precompute_embedding_cache(
             for key, tensor in reverse_inputs.items():
                 pending_reverse[key].append(tensor.to("cpu", dtype=storage_dtype))
             for modality in dataset.modalities:
-                pending_targets[modality].append(
-                    torch.stack(target_batch[modality], dim=0).detach().cpu()
+                target = torch.stack(target_batch[modality], dim=0).detach().cpu()
+                pending_targets[modality].append(target)
+                pending_targets_reverse[modality].append(
+                    reverse_complement_targets(
+                        target,
+                        dataset.strand_pair_by_modality[modality],
+                    )
                 )
                 target_batch[modality].clear()
             sequence_batch.clear()
@@ -1790,40 +1831,41 @@ def forward_heads(
                 return_scaled=return_scaled,
             )
 
-    with torch.no_grad():
-        if not return_scaled:
-            metric_predictions = {
-                modality: prediction.detach()
-                for modality, prediction in loss_predictions.items()
-            }
-        else:
-            unwrapped_heads = unwrap_heads(heads_model)
-            metric_predictions = {
-                modality: unwrapped_heads.heads[modality].unscale(
-                    prediction.detach(),
-                    head_organism_idx,
-                    unwrapped_heads.target_resolution,
-                    channels_last=True,
-                )
-                for modality, prediction in loss_predictions.items()
-            }
+    unwrapped_heads = unwrap_heads(heads_model)
+    if return_scaled:
+        experimental_predictions = {
+            modality: unwrapped_heads.heads[modality].unscale(
+                prediction,
+                head_organism_idx,
+                unwrapped_heads.target_resolution,
+                channels_last=True,
+            )
+            for modality, prediction in loss_predictions.items()
+        }
+    else:
+        experimental_predictions = loss_predictions
 
     switched_loss_predictions = {}
     switched_metric_predictions = {}
-    for modality, prediction in loss_predictions.items():
+    for modality, prediction in experimental_predictions.items():
         strand_pair = None
         if strand_pair_by_modality is not None:
             strand_pair = strand_pair_by_modality.get(modality)
-        switched_loss_predictions[modality] = switch_reverse_predictions(
+        switched_experimental = switch_reverse_predictions(
             prediction,
             reverse_complement,
             strand_pair,
         )
-        switched_metric_predictions[modality] = switch_reverse_predictions(
-            metric_predictions[modality],
-            reverse_complement,
-            strand_pair,
-        )
+        switched_metric_predictions[modality] = switched_experimental.detach()
+        if return_scaled:
+            switched_loss_predictions[modality] = unwrapped_heads.heads[modality].scale(
+                switched_experimental,
+                head_organism_idx,
+                unwrapped_heads.target_resolution,
+                channels_last=True,
+            )
+        else:
+            switched_loss_predictions[modality] = switched_experimental
 
     cropped_loss_predictions = {
         modality: crop_predictions(prediction, crop_bins)

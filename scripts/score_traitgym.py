@@ -40,6 +40,7 @@ from alphagenome_pytorch import AlphaGenome  # noqa: E402
 from alphagenome_pytorch.config import DtypePolicy  # noqa: E402
 from alphagenome_pytorch.extensions.finetuning.heads import create_finetuning_head  # noqa: E402
 from alphagenome_pytorch.extensions.finetuning.transfer import load_trunk, remove_all_heads  # noqa: E402
+from alphagenome_pytorch.named_outputs import TrackMetadataCatalog  # noqa: E402
 from finetune_tfr_heads import TFRHeads, forward_heads  # noqa: E402
 
 
@@ -369,12 +370,13 @@ def create_precomp_heads_model(
     return heads_model
 
 
-def make_track_anno(track_blocks: list[tuple[str, int, list[str] | None]]) -> pd.DataFrame:
+def make_track_anno(track_blocks: list[tuple[str, int | list[int], list[str] | None]]) -> pd.DataFrame:
     rows = []
     global_i = 0
-    for group, n_tracks, names in track_blocks:
-        for local_i in range(n_tracks):
-            name = names[local_i] if names and local_i < len(names) else f"{group}_{local_i}"
+    for group, track_spec, names in track_blocks:
+        local_indices = range(track_spec) if isinstance(track_spec, int) else track_spec
+        for out_i, local_i in enumerate(local_indices):
+            name = names[out_i] if names and out_i < len(names) else f"{group}_{local_i}"
             rows.append({
                 "track_index": global_i,
                 "local_index": local_i,
@@ -384,6 +386,26 @@ def make_track_anno(track_blocks: list[tuple[str, int, list[str] | None]]) -> pd
             })
             global_i += 1
     return pd.DataFrame(rows)
+
+
+def all_folds_track_blocks(
+    model: AlphaGenome,
+    heads: list[str],
+    organism_idx: int,
+) -> tuple[list[tuple[str, list[int], list[str]]], dict[str, list[int]], dict[str, int]]:
+    catalog = TrackMetadataCatalog.load_builtin(organism_idx)
+    track_blocks = []
+    keep_indices_by_head = {}
+    dropped_by_head = {}
+    for head in heads:
+        n_tracks = model.heads[head].num_tracks
+        tracks = catalog.get_tracks(head, organism=organism_idx, num_tracks=n_tracks, strict=True)
+        keep_tracks = [track for track in tracks if not track.is_padding]
+        keep_indices = [int(track.track_index) for track in keep_tracks]
+        track_blocks.append((head, keep_indices, [track.track_name for track in keep_tracks]))
+        keep_indices_by_head[head] = keep_indices
+        dropped_by_head[head] = n_tracks - len(keep_indices)
+    return track_blocks, keep_indices_by_head, dropped_by_head
 
 
 def unique_columns(names: list[str]) -> list[str]:
@@ -461,7 +483,15 @@ def score_all_folds(args: argparse.Namespace, variants: list[Variant]) -> tuple[
 
     context_length = args.context_length or 1_048_576
     organism_idx = torch.full((args.batch_size,), args.organism_idx, dtype=torch.long, device=device)
-    track_blocks = [(head, model.heads[head].num_tracks, None) for head in heads]
+    track_blocks, keep_indices_by_head, dropped_by_head = all_folds_track_blocks(
+        model,
+        heads,
+        args.organism_idx,
+    )
+    keep_tensors_by_head = {
+        head: torch.as_tensor(indices, dtype=torch.long, device=device)
+        for head, indices in keep_indices_by_head.items()
+    }
     track_anno = make_track_anno(track_blocks)
     scores = np.full((len(variants), len(track_anno)), np.nan, dtype=np.float32)
     errors: list[tuple[int, str]] = []
@@ -525,9 +555,19 @@ def score_all_folds(args: argparse.Namespace, variants: list[Variant]) -> tuple[
                     channels_last=True,
                 )
             for head in heads:
-                head_scores = traitgym_l2(pred_ref[head][128], pred_alt[head][128])
+                keep = keep_tensors_by_head[head]
+                head_scores = traitgym_l2(
+                    pred_ref[head][128].index_select(-1, keep),
+                    pred_alt[head][128].index_select(-1, keep),
+                )
                 if args.rc:
-                    head_scores = (head_scores + traitgym_l2(pred_ref_rc[head][128], pred_alt_rc[head][128])) / 2.0
+                    head_scores = (
+                        head_scores
+                        + traitgym_l2(
+                            pred_ref_rc[head][128].index_select(-1, keep),
+                            pred_alt_rc[head][128].index_select(-1, keep),
+                        )
+                    ) / 2.0
                 batch_scores.append(head_scores)
             scores[np.array(valid_rows, dtype=int), :] = np.concatenate(batch_scores, axis=1)
     finally:
@@ -539,6 +579,8 @@ def score_all_folds(args: argparse.Namespace, variants: list[Variant]) -> tuple[
         "context_length": context_length,
         "rc": args.rc,
         "organism_idx": args.organism_idx,
+        "padding_filtered": True,
+        "padding_dropped_by_head": json.dumps(dropped_by_head, sort_keys=True),
     }
     return scores, track_anno, attrs, errors
 

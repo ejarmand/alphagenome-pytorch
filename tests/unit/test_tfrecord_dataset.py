@@ -594,6 +594,66 @@ def test_cached_embedding_dataset_selects_reverse_embedding_with_rc_flag(
     )
 
 
+def test_cached_embedding_dataset_uses_cached_reverse_targets_when_available(tmp_path):
+    data_dir = _write_minimal_dataset(tmp_path)
+    (data_dir / "targets.txt").write_text(
+        "\t".join(["index", "identifier", "modality", "strand_pair"]) + "\n"
+        "0\tcell+\tRNA\t1\n"
+        "1\tcell-\tRNA\t0\n"
+        "2\tatac\tATAC\t2\n"
+    )
+    source_dataset = BaskervilleMultiTFRecordDataset(
+        data_dir,
+        modalities=["RNA"],
+        target_resolution=32,
+    )
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    source_dataset.files = [source_dataset.files[0]]
+    chunk_name = "train.file00000.chunk000000.pt"
+    torch.save(
+        {
+            "embeddings_forward_128bp": torch.ones(1, 4, 2),
+            "embeddings_reverse_128bp": torch.full((1, 4, 2), 2.0),
+            "targets": {
+                "RNA": {
+                    32: torch.tensor([[[1.0, 10.0], [2.0, 20.0]]])
+                }
+            },
+            "targets_reverse": {
+                "RNA": {
+                    32: torch.tensor([[[20.0, 2.0], [10.0, 1.0]]])
+                }
+            },
+        },
+        cache_dir / chunk_name,
+    )
+    embedding_cache_file_manifest_path(cache_dir, "train", 0).write_text(
+        json.dumps({
+            "file_name": source_dataset.files[0].name,
+            "chunks": [{"path": chunk_name, "num_examples": 1}],
+        })
+    )
+
+    dataset = CachedEmbeddingTFRecordDataset(
+        cache_dir,
+        split="train",
+        source_dataset=source_dataset,
+        augment_rc=True,
+        seed=0,
+    )
+
+    embeddings, targets, augmentation = next(iter(dataset))
+
+    assert augmentation["input_reverse_complement"] is True
+    assert augmentation["reverse_complement"] is False
+    torch.testing.assert_close(embeddings[128], torch.full((4, 2), 2.0))
+    torch.testing.assert_close(
+        targets["RNA"][32],
+        torch.tensor([[20.0, 2.0], [10.0, 1.0]]),
+    )
+
+
 def test_cached_embedding_dataset_uses_file_shards_for_rank_world_size(tmp_path):
     data_dir = _write_minimal_dataset(tmp_path)
     source_dataset = BaskervilleMultiTFRecordDataset(
@@ -698,6 +758,10 @@ def test_forward_heads_unscales_training_metrics_without_second_head_forward():
             del organism_idx, resolution, channels_last
             return x + 10.0
 
+        def scale(self, x, organism_idx, resolution, channels_last=True):
+            del organism_idx, resolution, channels_last
+            return x - 10.0
+
     class CountingHeads(torch.nn.Module):
         def __init__(self):
             super().__init__()
@@ -730,6 +794,54 @@ def test_forward_heads_unscales_training_metrics_without_second_head_forward():
     assert heads.calls == 1
     torch.testing.assert_close(predictions["ATAC"], expected)
     torch.testing.assert_close(metric_predictions["ATAC"], expected + 10.0)
+
+
+def test_forward_heads_switches_scaled_rc_predictions_in_experimental_space():
+    class ScaleHead(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("means", torch.tensor([[2.0, 5.0]]))
+
+        def unscale(self, x, organism_idx, resolution, channels_last=True):
+            del resolution
+            assert channels_last
+            return x * self.means[organism_idx][:, None, :]
+
+        def scale(self, x, organism_idx, resolution, channels_last=True):
+            del resolution
+            assert channels_last
+            return x / self.means[organism_idx][:, None, :]
+
+    class ScaledHeads(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.target_resolution = 128
+            self.heads = torch.nn.ModuleDict({"RNA": ScaleHead()})
+
+        def forward(self, embeddings, organism_idx, *, return_scaled):
+            del embeddings, organism_idx
+            assert return_scaled is True
+            return {
+                "RNA": torch.tensor([[[1.0, 10.0], [2.0, 20.0]]]),
+            }
+
+    predictions, metric_predictions = forward_heads(
+        torch.nn.Module(),
+        ScaledHeads(),
+        {128: torch.zeros(1, 2, 3)},
+        torch.zeros(1, dtype=torch.long),
+        crop_bins=0,
+        use_amp=False,
+        return_scaled=True,
+        requires_grad=True,
+        reverse_complement=torch.tensor([True]),
+        strand_pair_by_modality={"RNA": torch.tensor([1, 0])},
+    )
+
+    expected_metric = torch.tensor([[[100.0, 4.0], [50.0, 2.0]]])
+    expected_loss = torch.tensor([[[50.0, 0.8], [25.0, 0.4]]])
+    torch.testing.assert_close(metric_predictions["RNA"], expected_metric)
+    torch.testing.assert_close(predictions["RNA"], expected_loss)
 
 
 def test_poisson_multinomial_loss_alias_runs():
