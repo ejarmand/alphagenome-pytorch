@@ -1,4 +1,4 @@
-"""DNA sequence ↔ one-hot encoding conversions.
+"""DNA sequence ↔ one-hot encoding conversions and transforms.
 
 Provides canonical numpy implementations (``sequence_to_onehot``,
 ``onehot_to_sequence``) and thin torch wrappers (``sequence_to_onehot_tensor``,
@@ -32,24 +32,33 @@ for _i, _ch in enumerate(_BASES):
     _ENCODE_LOOKUP[ord(_ch.lower())] = _i
 
 
-def sequence_to_onehot(sequence: str) -> np.ndarray:
+def sequence_to_onehot(
+    sequence: str, dtype: "np.dtype | type" = np.uint8
+) -> np.ndarray:
     """Convert a DNA sequence string to a one-hot encoded numpy array.
 
     Handles both upper- and lower-case nucleotides.
-    Ambiguous / unknown bases (e.g. ``N``) are encoded as all-zeros.
+    Ambiguous / unknown bases (e.g. ``N``) are encoded as all-zeros,
+    matching the JAX reference.
 
     Args:
         sequence: DNA sequence string (``ACGTN``).
+        dtype: Output array dtype. Defaults to ``np.uint8`` (compact; the
+            model casts to its compute dtype at the forward boundary). Pass
+            ``np.float32`` if a downstream consumer needs float arithmetic on
+            the one-hot before it reaches the model.
 
     Returns:
-        One-hot encoded ``uint8`` array of shape ``(len(sequence), 4)``.
+        One-hot encoded array of shape ``(len(sequence), 4)`` and dtype
+        ``dtype``.
     """
     seq_bytes = np.frombuffer(sequence.encode("ascii"), dtype=np.uint8)
-    onehot = np.zeros((len(seq_bytes), 4), dtype=np.uint8)
+    onehot = np.zeros((len(seq_bytes), 4), dtype=dtype)
     # clip(0, 127) prevents crash on non-ASCII if present
     indices = _ENCODE_LOOKUP[seq_bytes.clip(0, 127)]
     mask = indices >= 0
-    onehot[np.where(mask)[0], indices[mask]] = 1
+    valid_rows = np.where(mask)[0]
+    onehot[valid_rows, indices[mask]] = 1
     return onehot
 
 
@@ -73,6 +82,68 @@ def onehot_to_sequence(onehot: np.ndarray) -> str:
     indices = onehot.argmax(axis=1)
     indices = np.where(is_valid, indices, 4)
     return "".join(bases[indices])
+
+
+def reverse_complement_onehot(onehot: np.ndarray) -> np.ndarray:
+    """Reverse complement a channels-last one-hot encoded DNA sequence.
+
+    Args:
+        onehot: Array of shape ``(L, 4)`` or ``(B, L, 4)`` in A/C/G/T order.
+
+    Returns:
+        Reverse-complemented array with the same shape and dtype.
+    """
+    if onehot.ndim == 2:
+        return onehot[::-1, [3, 2, 1, 0]].copy()
+    if onehot.ndim == 3:
+        return onehot[:, ::-1, :][:, :, [3, 2, 1, 0]].copy()
+    raise ValueError(f"Expected shape (L, 4) or (B, L, 4), got {onehot.shape}")
+
+
+def shift_onehot(
+    onehot: np.ndarray,
+    shift: int,
+    pad_value: float = 0.0,
+) -> np.ndarray:
+    """Shift a channels-last one-hot DNA sequence along the length axis.
+
+    This mirrors Baskerville's sequence-shift semantics: positive shifts move
+    sequence content to the right and pad the left; negative shifts move content
+    to the left and pad the right.
+
+    Args:
+        onehot: Array of shape ``(L, 4)`` or ``(B, L, 4)``.
+        shift: Signed shift in bp.
+        pad_value: Value used for padded positions. AlphaGenome unknown bases
+            are represented as all-zeros, so the default is ``0.0``.
+
+    Returns:
+        Shifted array with the same shape and dtype.
+    """
+    if onehot.ndim not in (2, 3):
+        raise ValueError(f"Expected shape (L, 4) or (B, L, 4), got {onehot.shape}")
+    if onehot.shape[-1] != 4:
+        raise ValueError(f"Expected last dimension of size 4, got {onehot.shape}")
+    if shift == 0:
+        return onehot
+
+    length_axis = 0 if onehot.ndim == 2 else 1
+    length = onehot.shape[length_axis]
+    if abs(shift) >= length:
+        return np.full_like(onehot, pad_value)
+
+    shifted = np.full_like(onehot, pad_value)
+    if onehot.ndim == 2:
+        if shift > 0:
+            shifted[shift:, :] = onehot[:-shift, :]
+        else:
+            shifted[:shift, :] = onehot[-shift:, :]
+    else:
+        if shift > 0:
+            shifted[:, shift:, :] = onehot[:, :-shift, :]
+        else:
+            shifted[:, :shift, :] = onehot[:, -shift:, :]
+    return shifted
 
 
 # ---------------------------------------------------------------------------
@@ -126,9 +197,62 @@ def onehot_tensor_to_sequence(onehot: "torch.Tensor") -> str:
     return onehot_to_sequence(onehot.detach().cpu().numpy())
 
 
+def reverse_complement_onehot_tensor(onehot: "torch.Tensor") -> "torch.Tensor":
+    """Torch equivalent of :func:`reverse_complement_onehot`."""
+    import torch as _torch
+
+    if onehot.dim() == 2:
+        return _torch.flip(onehot, dims=[0]).index_select(
+            -1,
+            _torch.tensor([3, 2, 1, 0], device=onehot.device),
+        )
+    if onehot.dim() == 3:
+        return _torch.flip(onehot, dims=[1]).index_select(
+            -1,
+            _torch.tensor([3, 2, 1, 0], device=onehot.device),
+        )
+    raise ValueError(f"Expected shape (L, 4) or (B, L, 4), got {tuple(onehot.shape)}")
+
+
+def shift_onehot_tensor(
+    onehot: "torch.Tensor",
+    shift: int,
+    pad_value: float = 0.0,
+) -> "torch.Tensor":
+    """Torch equivalent of :func:`shift_onehot`."""
+    import torch as _torch
+
+    if onehot.dim() not in (2, 3) or onehot.shape[-1] != 4:
+        raise ValueError(f"Expected shape (L, 4) or (B, L, 4), got {tuple(onehot.shape)}")
+    if shift == 0:
+        return onehot
+
+    length_axis = 0 if onehot.dim() == 2 else 1
+    length = onehot.shape[length_axis]
+    shifted = _torch.full_like(onehot, pad_value)
+    if abs(shift) >= length:
+        return shifted
+
+    if onehot.dim() == 2:
+        if shift > 0:
+            shifted[shift:, :] = onehot[:-shift, :]
+        else:
+            shifted[:shift, :] = onehot[-shift:, :]
+    else:
+        if shift > 0:
+            shifted[:, shift:, :] = onehot[:, :-shift, :]
+        else:
+            shifted[:, :shift, :] = onehot[:, -shift:, :]
+    return shifted
+
+
 __all__ = [
     "sequence_to_onehot",
     "onehot_to_sequence",
+    "reverse_complement_onehot",
+    "shift_onehot",
     "sequence_to_onehot_tensor",
     "onehot_tensor_to_sequence",
+    "reverse_complement_onehot_tensor",
+    "shift_onehot_tensor",
 ]

@@ -21,8 +21,10 @@ from torch.amp import autocast
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
 from tqdm import tqdm
 
+from alphagenome_pytorch import losses
 from alphagenome_pytorch.losses import multinomial_loss
 
 # Number of segments for multinomial loss computation.
@@ -186,11 +188,24 @@ def compute_finetuning_loss(
     positional_weight: float,
     device: torch.device,
     channels_last: bool = True,
+    *,
+    gene_mask: Tensor | None = None,
+    gene_loss_weight: float = 0.0,
+    gene_cross_track_weight: float = 5.0,
+    strand_channel_mask: Tensor | None = None,
 ) -> tuple[Tensor, dict[str, Tensor]]:
     """Compute combined loss across resolutions.
 
     Uses dynamic multinomial_resolution = seq_len // 8 for consistent loss
     granularity across different sequence lengths.
+
+    Optionally adds the cross-track gene LFC term (Decima-style; see
+    `losses.gene_lfc_loss`) at 1bp resolution when:
+      - `gene_loss_weight > 0`
+      - `gene_mask` and `strand_channel_mask` are both provided
+      - `predictions` / `targets` contain key `1`
+    The gene LFC contribution is `resolution_weights[1] * gene_loss_weight *
+    gene_lfc_term` so it scales with the existing 1bp resolution weight.
 
     Args:
         predictions: Dict mapping resolution to prediction tensors.
@@ -199,6 +214,15 @@ def compute_finetuning_loss(
         positional_weight: Weight for positional component of multinomial loss.
         device: Torch device.
         channels_last: If True, assumes (B, S, C). If False, assumes (B, C, S).
+        gene_mask: Optional `[B, S, 2, G]` gene-body mask for the gene LFC
+            term. Ignored if `gene_loss_weight <= 0`.
+        gene_loss_weight: Outer weight on the gene LFC term (paper: 0.1).
+            Default 0.0 disables the term entirely (no behavioral change vs.
+            the pre-B3.2 loss path).
+        gene_cross_track_weight: Inner weight on the multinomial component
+            of the gene LFC term (paper default: 5.0).
+        strand_channel_mask: Optional `[2, 1, C]` track strand-compatibility
+            mask, required when `gene_loss_weight > 0`.
 
     Returns:
         Tuple of (total_loss, loss_dict) where loss_dict contains per-resolution
@@ -245,8 +269,49 @@ def compute_finetuning_loss(
             channels_last=channels_last,
         )
 
-        total_loss = total_loss + weight * res_loss_dict["loss"]
-        loss_dict[f"loss_{res}bp"] = res_loss_dict["loss"]
+        res_loss = res_loss_dict["loss"]
+
+        # Add gene LFC term at 1bp resolution when enabled. Mirrors upstream
+        # which only threads gene_mask through the resolution=1 head path.
+        if res == 1 and gene_loss_weight > 0:
+            # Fail loud on a wiring error: when the gene term is enabled, the
+            # dataset always yields a (possibly all-zero) gene_mask tensor and
+            # strand_channel_mask is required. A None here means a dependency
+            # was never threaded through, so silently skipping would train
+            # without the intended term.
+            missing_args = []
+            if gene_mask is None:
+                missing_args.append("gene_mask")
+            if strand_channel_mask is None:
+                missing_args.append("strand_channel_mask")
+            if missing_args:
+                raise ValueError(
+                    "gene_loss_weight > 0 requires "
+                    f"{', '.join(missing_args)} to be provided for the gene "
+                    "LFC loss at 1bp resolution."
+                )
+            # gene_lfc_loss expects channels-last; transpose if needed.
+            if channels_last:
+                pred_nlc, target_nlc, mask_nlc = pred, target, mask
+            else:
+                pred_nlc = pred.transpose(-1, -2).contiguous()
+                target_nlc = target.transpose(-1, -2).contiguous()
+                mask_nlc = mask.transpose(-1, -2).contiguous()
+            gene_loss, gene_aux = losses.gene_lfc_loss(
+                predictions=pred_nlc,
+                targets=target_nlc,
+                targets_mask=mask_nlc,
+                gene_mask=gene_mask,
+                strand_channel_mask=strand_channel_mask,
+                gene_cross_track_weight=gene_cross_track_weight,
+            )
+            res_loss = res_loss + gene_loss_weight * gene_loss
+            loss_dict["loss_gene_lfc"] = gene_loss
+            loss_dict["loss_gene_total_count"] = gene_aux["gene_loss_total_count"]
+            loss_dict["loss_gene_positional"] = gene_aux["gene_loss_positional"]
+
+        total_loss = total_loss + weight * res_loss
+        loss_dict[f"loss_{res}bp"] = res_loss
 
     loss_dict["loss"] = total_loss
     return total_loss, loss_dict
@@ -266,6 +331,11 @@ def train_epoch(
     use_amp: bool = True,
     accumulation_steps: int = 1,
     resolutions: tuple[int, ...] | None = None,
+    *,
+    gene_loss_weight: float = 0.0,
+    gene_cross_track_weight: float = 5.0,
+    strand_channel_mask: Tensor | None = None,
+    organism: int = 0,
 ) -> float:
     """Train for one epoch.
 
@@ -287,6 +357,14 @@ def train_epoch(
         resolutions: Tuple of resolutions to train on (e.g., (1,), (128,), or (1, 128)).
             If None, inferred from resolution_weights keys. Training on 1bp resolution
             requires significantly more memory than 128bp.
+        gene_loss_weight: Outer weight on the gene LFC term (paper: 0.1 for
+            RNA-seq). Default 0.0 disables. Requires `train_loader` to yield
+            3-tuples (sequence, targets, gene_mask) and `strand_channel_mask`
+            to be set.
+        gene_cross_track_weight: Inner multinomial weight inside the gene LFC
+            term (paper default: 5.0).
+        strand_channel_mask: `[2, 1, C]` track strand-compatibility mask,
+            required when gene_loss_weight > 0.
 
     Returns:
         Average training loss for the epoch.
@@ -303,6 +381,11 @@ def train_epoch(
     if invalid := (set(resolutions) - {1, 128}):
         raise ValueError(f"Invalid resolutions {invalid}, must be 1 or 128")
 
+    if gene_loss_weight > 0 and strand_channel_mask is None:
+        raise ValueError(
+            "gene_loss_weight > 0 requires strand_channel_mask to be set."
+        )
+
     # Set up autocast context (bfloat16 on CUDA, no-op on CPU)
     if use_amp and device.type == "cuda":
         amp_context = autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -310,12 +393,20 @@ def train_epoch(
         amp_context = nullcontext()
 
     pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
-    for batch_idx, (sequences, targets_dict) in enumerate(pbar):
+    for batch_idx, batch_data in enumerate(pbar):
+        # Dataset returns a 3-tuple when gene_mask is configured, else 2-tuple.
+        if len(batch_data) == 3:
+            sequences, targets_dict, gene_mask = batch_data
+            gene_mask = gene_mask.to(device)
+        else:
+            sequences, targets_dict = batch_data
+            gene_mask = None
         sequences = sequences.to(device)
         targets_dict = {k: v.to(device) for k, v in targets_dict.items() if k in resolutions}
 
-        # Organism index (assume human)
-        organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
+        # Organism index for this fine-tune (0=human, 1=mouse); the forward
+        # uses the matching organism embedding + head slot.
+        organism_idx = torch.full((sequences.shape[0],), organism, dtype=torch.long, device=device)
 
         with amp_context:
             # Forward through trunk
@@ -343,6 +434,10 @@ def train_epoch(
                 positional_weight=positional_weight,
                 device=device,
                 channels_last=True,
+                gene_mask=gene_mask,
+                gene_loss_weight=gene_loss_weight,
+                gene_cross_track_weight=gene_cross_track_weight,
+                strand_channel_mask=strand_channel_mask,
             )
 
         # Scale loss for gradient accumulation
@@ -384,6 +479,7 @@ def validate(
     positional_weight: float,
     use_amp: bool = True,
     resolutions: tuple[int, ...] | None = None,
+    organism: int = 0,
 ) -> float:
     """Validate the model.
 
@@ -419,38 +515,39 @@ def validate(
     else:
         amp_context = nullcontext()
 
-    for sequences, targets_dict in tqdm(val_loader, desc="Validation"):
-        sequences = sequences.to(device)
-        targets_dict = {k: v.to(device) for k, v in targets_dict.items() if k in resolutions}
-        organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
+    with torch.no_grad():
+        for sequences, targets_dict in tqdm(val_loader, desc="Validation"):
+            sequences = sequences.to(device)
+            targets_dict = {k: v.to(device) for k, v in targets_dict.items() if k in resolutions}
+            organism_idx = torch.full((sequences.shape[0],), organism, dtype=torch.long, device=device)
 
-        with amp_context:
-            outputs = model(sequences, organism_idx, return_embeddings=True, channels_last=False)
+            with amp_context:
+                outputs = model(sequences, organism_idx, return_embeddings=True, channels_last=False)
 
-            # Only get embeddings for requested resolutions
-            embeddings_dict = {}
-            if 1 in resolutions:
-                emb = outputs.get("embeddings_1bp")
-                if emb is not None:
-                    embeddings_dict[1] = emb
-            if 128 in resolutions:
-                emb = outputs.get("embeddings_128bp")
-                if emb is not None:
-                    embeddings_dict[128] = emb
+                # Only get embeddings for requested resolutions
+                embeddings_dict = {}
+                if 1 in resolutions:
+                    emb = outputs.get("embeddings_1bp")
+                    if emb is not None:
+                        embeddings_dict[1] = emb
+                if 128 in resolutions:
+                    emb = outputs.get("embeddings_128bp")
+                    if emb is not None:
+                        embeddings_dict[128] = emb
 
-            predictions = head(embeddings_dict, organism_idx)
+                predictions = head(embeddings_dict, organism_idx)
 
-            loss, _ = compute_finetuning_loss(
-                predictions=predictions,
-                targets=targets_dict,
-                resolution_weights=resolution_weights,
-                positional_weight=positional_weight,
-                device=device,
-                channels_last=True,
-            )
+                loss, _ = compute_finetuning_loss(
+                    predictions=predictions,
+                    targets=targets_dict,
+                    resolution_weights=resolution_weights,
+                    positional_weight=positional_weight,
+                    device=device,
+                    channels_last=True,
+                )
 
-        total_loss += loss.item()
-        n_batches += 1
+            total_loss += loss.item()
+            n_batches += 1
 
     return total_loss / max(1, n_batches)
 
@@ -601,6 +698,7 @@ def train_epoch_ddp(
     profile_batches: int = 0,
     log_fn: Any | None = None,
     encoder_only: bool = False,
+    organism: int = 0,
 ) -> float:
     """Train for one epoch with DDP and profiling support.
 
@@ -688,7 +786,7 @@ def train_epoch_ddp(
             t0 = time.perf_counter()
 
         sequences = sequences.to(device)
-        organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
+        organism_idx = torch.full((sequences.shape[0],), organism, dtype=torch.long, device=device)
 
         if is_profiling:
             _cuda_sync(device)
@@ -804,15 +902,23 @@ def train_epoch_ddp(
             _cuda_sync(device)
             t0 = time.perf_counter()
 
-        scaled_loss.backward()
+        # --- Optimizer step (only every accumulation_steps batches) ---
+        is_accumulation_step = (batch_idx + 1) % accumulation_steps == 0
+        is_last_batch = batch_idx == len(train_loader) - 1
+
+        # Skip DDP gradient sync on intermediate accumulation steps
+        no_sync = (
+            accumulation_steps > 1
+            and not is_accumulation_step
+            and not is_last_batch
+            and hasattr(model, "no_sync")
+        )
+        with model.no_sync() if no_sync else nullcontext():
+            scaled_loss.backward()
 
         if is_profiling:
             _cuda_sync(device)
             profile_stats.add("5_backward", time.perf_counter() - t0)
-
-        # --- Optimizer step (only every accumulation_steps batches) ---
-        is_accumulation_step = (batch_idx + 1) % accumulation_steps == 0
-        is_last_batch = batch_idx == len(train_loader) - 1
 
         if is_accumulation_step or is_last_batch:
             if is_profiling:
@@ -909,6 +1015,7 @@ def validate_ddp(
     rank: int = 0,
     world_size: int = 1,
     encoder_only: bool = False,
+    organism: int = 0,
 ) -> tuple[float, dict[str, Any]]:
     """Validate the model with DDP support and Pearson R metrics.
 
@@ -964,91 +1071,92 @@ def validate_ddp(
     else:
         pbar = val_loader
 
-    for sequences, targets_dict in pbar:
-        sequences = sequences.to(device)
-        organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
-        resolutions = tuple(resolution_weights.keys())
+    with torch.no_grad():
+        for sequences, targets_dict in pbar:
+            sequences = sequences.to(device)
+            organism_idx = torch.full((sequences.shape[0],), organism, dtype=torch.long, device=device)
+            resolutions = tuple(resolution_weights.keys())
 
-        if encoder_only:
-            outputs = model(sequences, organism_idx, encoder_only=True)
-            embeddings_dict = {128: outputs["encoder_output"]}
-        else:
+            if encoder_only:
+                outputs = model(sequences, organism_idx, encoder_only=True)
+                embeddings_dict = {128: outputs["encoder_output"]}
+            else:
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                    outputs = model(sequences, organism_idx, return_embeddings=True, resolutions=resolutions, channels_last=False)
+
+                embeddings_dict = {}
+                for res in resolution_weights:
+                    emb_key = f"embeddings_{res}bp"
+                    if emb_key in outputs:
+                        embeddings_dict[res] = outputs[emb_key]
+
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
-                outputs = model(sequences, organism_idx, return_embeddings=True, resolutions=resolutions, channels_last=False)
-
-            embeddings_dict = {}
-            for res in resolution_weights:
-                emb_key = f"embeddings_{res}bp"
-                if emb_key in outputs:
-                    embeddings_dict[res] = outputs[emb_key]
-
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
-            # Get predictions in MODEL space for loss computation
-            head_module = head.module if hasattr(head, "module") else head
-            predictions_scaled = head(
-                embeddings_dict, organism_idx, return_scaled=True, channels_last=True
-            )
-
-            # Get predictions in EXPERIMENTAL space for Pearson R
-            if compute_pearson:
-                predictions_unscaled = head(
-                    embeddings_dict, organism_idx, return_scaled=False, channels_last=True
+                # Get predictions in MODEL space for loss computation
+                head_module = head.module if hasattr(head, "module") else head
+                predictions_scaled = head(
+                    embeddings_dict, organism_idx, return_scaled=True, channels_last=True
                 )
 
-        loss = torch.tensor(0.0, device=device)
+                # Get predictions in EXPERIMENTAL space for Pearson R
+                if compute_pearson:
+                    predictions_unscaled = head(
+                        embeddings_dict, organism_idx, return_scaled=False, channels_last=True
+                    )
 
-        for res, weight in resolution_weights.items():
-            if res not in predictions_scaled or res not in targets_dict:
-                continue
+            loss = torch.tensor(0.0, device=device)
 
-            pred_scaled = predictions_scaled[res]
-            targets = targets_dict[res].to(device)
+            for res, weight in resolution_weights.items():
+                if res not in predictions_scaled or res not in targets_dict:
+                    continue
 
-            # Scale targets from experimental space to model space for loss
-            targets_scaled = head_module.scale(
-                targets, organism_idx, resolution=res, channels_last=True
-            )
-            mask = torch.ones(
-                pred_scaled.shape[0], 1, pred_scaled.shape[-1], dtype=torch.bool, device=device
-            )
+                pred_scaled = predictions_scaled[res]
+                targets = targets_dict[res].to(device)
 
-            # Compute multinomial loss
-            current_seq_len = pred_scaled.shape[-2]
-            multinomial_res = _compute_multinomial_resolution(
-                current_seq_len, num_segments, min_segment_size
-            )
+                # Scale targets from experimental space to model space for loss
+                targets_scaled = head_module.scale(
+                    targets, organism_idx, resolution=res, channels_last=True
+                )
+                mask = torch.ones(
+                    pred_scaled.shape[0], 1, pred_scaled.shape[-1], dtype=torch.bool, device=device
+                )
 
-            loss_dict = multinomial_loss(
-                y_pred=pred_scaled,
-                y_true=targets_scaled,
-                mask=mask,
-                multinomial_resolution=multinomial_res,
-                positional_weight=positional_weight,
-                count_weight=count_weight,
-                channels_last=True,
-            )
+                # Compute multinomial loss
+                current_seq_len = pred_scaled.shape[-2]
+                multinomial_res = _compute_multinomial_resolution(
+                    current_seq_len, num_segments, min_segment_size
+                )
 
-            res_loss = loss_dict["loss"] * weight
-            loss = loss + res_loss
-            loss_by_resolution[f"{res}bp"] += res_loss.item()
-            # Log raw (unweighted) losses for comparability across runs
-            loss_by_resolution[f"{res}bp_count"] += loss_dict["loss_total"].item()
-            loss_by_resolution[f"{res}bp_positional"] += loss_dict["loss_positional"].item()
+                loss_dict = multinomial_loss(
+                    y_pred=pred_scaled,
+                    y_true=targets_scaled,
+                    mask=mask,
+                    multinomial_resolution=multinomial_res,
+                    positional_weight=positional_weight,
+                    count_weight=count_weight,
+                    channels_last=True,
+                )
 
-            # Accumulate for Pearson R (in experimental space)
-            if compute_pearson:
-                pred_unscaled = predictions_unscaled[res]
+                res_loss = loss_dict["loss"] * weight
+                loss = loss + res_loss
+                loss_by_resolution[f"{res}bp"] += res_loss.item()
+                # Log raw (unweighted) losses for comparability across runs
+                loss_by_resolution[f"{res}bp_count"] += loss_dict["loss_total"].item()
+                loss_by_resolution[f"{res}bp_positional"] += loss_dict["loss_positional"].item()
 
-                # Profile Pearson R: compute per-region correlation on-the-fly, store scalars
-                batch_profile_r = profile_pearson_r(pred_unscaled, targets)  # (batch, tracks)
-                accumulated_profile_r[res].append(batch_profile_r.float().cpu())
+                # Accumulate for Pearson R (in experimental space)
+                if compute_pearson:
+                    pred_unscaled = predictions_unscaled[res]
 
-                # Count Pearson R: store total counts per region (tiny memory)
-                accumulated_pred_counts[res].append(pred_unscaled.sum(dim=1).float().cpu())  # (batch, tracks)
-                accumulated_true_counts[res].append(targets.sum(dim=1).float().cpu())
+                    # Profile Pearson R: compute per-region correlation on-the-fly, store scalars
+                    batch_profile_r = profile_pearson_r(pred_unscaled, targets)  # (batch, tracks)
+                    accumulated_profile_r[res].append(batch_profile_r.float().cpu())
 
-        total_loss += loss.item()
-        n_batches += 1
+                    # Count Pearson R: store total counts per region (tiny memory)
+                    accumulated_pred_counts[res].append(pred_unscaled.sum(dim=1).float().cpu())  # (batch, tracks)
+                    accumulated_true_counts[res].append(targets.sum(dim=1).float().cpu())
+
+            total_loss += loss.item()
+            n_batches += 1
 
     # Reduce across all processes
     avg_loss = total_loss / max(1, n_batches)
@@ -1128,6 +1236,11 @@ def train_epoch_multihead(
     profile_batches: int = 0,
     log_fn: Any | None = None,
     encoder_only: bool = False,
+    *,
+    gene_loss_weights: dict[str, float] | None = None,
+    gene_cross_track_weight: float = 5.0,
+    strand_channel_masks: dict[str, Tensor] | None = None,
+    organism: int = 0,
 ) -> tuple[float, dict[str, float]]:
     """Train for one epoch with multiple modality heads.
 
@@ -1197,7 +1310,17 @@ def train_epoch_multihead(
     running_loss = 0.0
     accumulated_batches = 0
 
-    for batch_idx, (sequences, modality_targets) in enumerate(pbar):
+    gene_loss_weights = gene_loss_weights or {}
+
+    for batch_idx, batch_data in enumerate(pbar):
+        # Dataset returns 3-tuple when gene_mask is configured, else 2-tuple.
+        if len(batch_data) == 3:
+            sequences, modality_targets, gene_mask = batch_data
+            gene_mask = gene_mask.to(device)
+        else:
+            sequences, modality_targets = batch_data
+            gene_mask = None
+
         is_profiling = do_profile and batch_idx < profile_batches
 
         if is_profiling and batch_idx > 0:
@@ -1210,7 +1333,7 @@ def train_epoch_multihead(
             t0 = time.perf_counter()
 
         sequences = sequences.to(device)
-        organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
+        organism_idx = torch.full((sequences.shape[0],), organism, dtype=torch.long, device=device)
 
         if is_profiling:
             _cuda_sync(device)
@@ -1309,6 +1432,32 @@ def train_epoch_multihead(
                 )
 
                 res_loss = loss_dict["loss"] * weight
+
+                # Optional gene LFC term (Decima-style cross-track loss).
+                # Only applies at 1bp resolution to the head whose modality
+                # has a non-zero entry in `gene_loss_weights`. Mirrors
+                # upstream which threads gene_mask only through res=1.
+                gene_w = gene_loss_weights.get(modality, 0.0)
+                if (
+                    res == 1
+                    and gene_w > 0
+                    and gene_mask is not None
+                    and strand_channel_masks is not None
+                    and modality in strand_channel_masks
+                ):
+                    gene_loss, gene_aux = losses.gene_lfc_loss(
+                        predictions=pred,
+                        targets=targets,
+                        targets_mask=mask,
+                        gene_mask=gene_mask,
+                        strand_channel_mask=strand_channel_masks[modality],
+                        gene_cross_track_weight=gene_cross_track_weight,
+                    )
+                    res_loss = res_loss + weight * gene_w * gene_loss
+                    loss_components[f"{modality}_gene_lfc"] = gene_loss.item()
+                    loss_components[f"{modality}_gene_total_count"] = gene_aux["gene_loss_total_count"].item()
+                    loss_components[f"{modality}_gene_positional"] = gene_aux["gene_loss_positional"].item()
+
                 modality_loss = modality_loss + res_loss
                 loss_components[f"{modality}_loss_{res}bp"] = res_loss.item()
                 loss_components[f"{modality}_loss_{res}bp_count"] = loss_dict["loss_total"].item()
@@ -1330,15 +1479,23 @@ def train_epoch_multihead(
             _cuda_sync(device)
             t0 = time.perf_counter()
 
-        scaled_loss.backward()
+        # Optimizer step
+        is_accumulation_step = (batch_idx + 1) % accumulation_steps == 0
+        is_last_batch = batch_idx == len(train_loader) - 1
+
+        # Skip DDP gradient sync on intermediate accumulation steps
+        no_sync = (
+            accumulation_steps > 1
+            and not is_accumulation_step
+            and not is_last_batch
+            and hasattr(model, "no_sync")
+        )
+        with model.no_sync() if no_sync else nullcontext():
+            scaled_loss.backward()
 
         if is_profiling:
             _cuda_sync(device)
             profile_stats.add("5_backward", time.perf_counter() - t0)
-
-        # Optimizer step
-        is_accumulation_step = (batch_idx + 1) % accumulation_steps == 0
-        is_last_batch = batch_idx == len(train_loader) - 1
 
         if is_accumulation_step or is_last_batch:
             if is_profiling:
@@ -1435,6 +1592,7 @@ def validate_multihead(
     rank: int = 0,
     world_size: int = 1,
     encoder_only: bool = False,
+    organism: int = 0,
 ) -> tuple[float, dict[str, Any]]:
     """Validate model with multiple modality heads.
 
@@ -1484,97 +1642,98 @@ def validate_multihead(
     else:
         pbar = val_loader
 
-    for sequences, modality_targets in pbar:
-        sequences = sequences.to(device)
-        organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
+    with torch.no_grad():
+        for sequences, modality_targets in pbar:
+            sequences = sequences.to(device)
+            organism_idx = torch.full((sequences.shape[0],), organism, dtype=torch.long, device=device)
 
-        # Collect all resolutions
-        all_resolutions = set()
-        for modality in heads:
-            all_resolutions.update(resolution_weights.get(modality, {}).keys())
-        resolutions = tuple(all_resolutions)
+            # Collect all resolutions
+            all_resolutions = set()
+            for modality in heads:
+                all_resolutions.update(resolution_weights.get(modality, {}).keys())
+            resolutions = tuple(all_resolutions)
 
-        if encoder_only:
-            outputs = model(sequences, organism_idx, encoder_only=True)
-            embeddings_dict = {128: outputs["encoder_output"]}
-        else:
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
-                outputs = model(sequences, organism_idx, return_embeddings=True, resolutions=resolutions, channels_last=False)
+            if encoder_only:
+                outputs = model(sequences, organism_idx, encoder_only=True)
+                embeddings_dict = {128: outputs["encoder_output"]}
+            else:
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                    outputs = model(sequences, organism_idx, return_embeddings=True, resolutions=resolutions, channels_last=False)
 
-            embeddings_dict = {}
-            for res in resolutions:
-                emb_key = f"embeddings_{res}bp"
-                if emb_key in outputs:
-                    embeddings_dict[res] = outputs[emb_key]
+                embeddings_dict = {}
+                for res in resolutions:
+                    emb_key = f"embeddings_{res}bp"
+                    if emb_key in outputs:
+                        embeddings_dict[res] = outputs[emb_key]
 
-        loss = torch.tensor(0.0, device=device)
+            loss = torch.tensor(0.0, device=device)
 
-        for modality, head in heads.items():
-            if modality not in modality_targets:
-                continue
-
-            modality_weight = modality_weights.get(modality, 1.0)
-            res_weights = resolution_weights.get(modality, {})
-            targets_dict = modality_targets[modality]
-
-            head_module = head.module if hasattr(head, "module") else head
-
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
-                predictions_scaled = head(
-                    embeddings_dict, organism_idx, return_scaled=True, channels_last=True
-                )
-                if compute_pearson:
-                    predictions_unscaled = head(
-                        embeddings_dict, organism_idx, return_scaled=False, channels_last=True
-                    )
-
-            modality_loss = torch.tensor(0.0, device=device)
-
-            for res, weight in res_weights.items():
-                if res not in predictions_scaled or res not in targets_dict:
+            for modality, head in heads.items():
+                if modality not in modality_targets:
                     continue
 
-                pred_scaled = predictions_scaled[res]
-                targets = targets_dict[res].to(device)
-                targets_scaled = head_module.scale(
-                    targets, organism_idx, resolution=res, channels_last=True
-                )
-                mask = torch.ones(
-                    pred_scaled.shape[0], 1, pred_scaled.shape[-1], dtype=torch.bool, device=device
-                )
+                modality_weight = modality_weights.get(modality, 1.0)
+                res_weights = resolution_weights.get(modality, {})
+                targets_dict = modality_targets[modality]
 
-                current_seq_len = pred_scaled.shape[-2]
-                multinomial_res = _compute_multinomial_resolution(
-                    current_seq_len, num_segments, min_segment_size
-                )
+                head_module = head.module if hasattr(head, "module") else head
 
-                loss_dict = multinomial_loss(
-                    y_pred=pred_scaled,
-                    y_true=targets_scaled,
-                    mask=mask,
-                    multinomial_resolution=multinomial_res,
-                    positional_weight=positional_weight,
-                    count_weight=count_weight,
-                    channels_last=True,
-                )
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                    predictions_scaled = head(
+                        embeddings_dict, organism_idx, return_scaled=True, channels_last=True
+                    )
+                    if compute_pearson:
+                        predictions_unscaled = head(
+                            embeddings_dict, organism_idx, return_scaled=False, channels_last=True
+                        )
 
-                res_loss = loss_dict["loss"] * weight
-                modality_loss = modality_loss + res_loss
+                modality_loss = torch.tensor(0.0, device=device)
 
-                # Accumulate for Pearson R
-                if compute_pearson:
-                    pred_unscaled = predictions_unscaled[res]
-                    batch_profile_r = profile_pearson_r(pred_unscaled, targets)
-                    accumulated_profile_r[modality][res].append(batch_profile_r.float().cpu())
-                    accumulated_pred_counts[modality][res].append(pred_unscaled.sum(dim=1).float().cpu())
-                    accumulated_true_counts[modality][res].append(targets.sum(dim=1).float().cpu())
+                for res, weight in res_weights.items():
+                    if res not in predictions_scaled or res not in targets_dict:
+                        continue
 
-            weighted_modality_loss = modality_loss * modality_weight
-            loss = loss + weighted_modality_loss
-            modality_loss_accum[modality] += modality_loss.item()
+                    pred_scaled = predictions_scaled[res]
+                    targets = targets_dict[res].to(device)
+                    targets_scaled = head_module.scale(
+                        targets, organism_idx, resolution=res, channels_last=True
+                    )
+                    mask = torch.ones(
+                        pred_scaled.shape[0], 1, pred_scaled.shape[-1], dtype=torch.bool, device=device
+                    )
 
-        total_loss_accum += loss.item()
-        n_batches += 1
+                    current_seq_len = pred_scaled.shape[-2]
+                    multinomial_res = _compute_multinomial_resolution(
+                        current_seq_len, num_segments, min_segment_size
+                    )
+
+                    loss_dict = multinomial_loss(
+                        y_pred=pred_scaled,
+                        y_true=targets_scaled,
+                        mask=mask,
+                        multinomial_resolution=multinomial_res,
+                        positional_weight=positional_weight,
+                        count_weight=count_weight,
+                        channels_last=True,
+                    )
+
+                    res_loss = loss_dict["loss"] * weight
+                    modality_loss = modality_loss + res_loss
+
+                    # Accumulate for Pearson R
+                    if compute_pearson:
+                        pred_unscaled = predictions_unscaled[res]
+                        batch_profile_r = profile_pearson_r(pred_unscaled, targets)
+                        accumulated_profile_r[modality][res].append(batch_profile_r.float().cpu())
+                        accumulated_pred_counts[modality][res].append(pred_unscaled.sum(dim=1).float().cpu())
+                        accumulated_true_counts[modality][res].append(targets.sum(dim=1).float().cpu())
+
+                weighted_modality_loss = modality_loss * modality_weight
+                loss = loss + weighted_modality_loss
+                modality_loss_accum[modality] += modality_loss.item()
+
+            total_loss_accum += loss.item()
+            n_batches += 1
 
     # Reduce across processes
     avg_loss = total_loss_accum / max(1, n_batches)
@@ -1622,6 +1781,358 @@ def validate_multihead(
     return avg_loss, metrics
 
 
+def train_epoch_sequence_parallel(
+    model: nn.Module,
+    heads: dict[str, nn.Module],
+    train_loader: DataLoader,
+    optimizer: Optimizer,
+    scheduler: LambdaLR,
+    device: torch.device,
+    modality_weights: dict[str, float],
+    resolution_weights: dict[str, dict[int, float]],
+    positional_weight: float,
+    count_weight: float,
+    sequence_parallel: Any,
+    epoch: int,
+    log_every: int,
+    use_amp: bool = True,
+    accumulation_steps: int = 1,
+    frozen_backbone: bool = False,
+    num_segments: int = NUM_SEGMENTS,
+    min_segment_size: int | None = None,
+    train_sampler: DistributedSampler | None = None,
+    rank: int = 0,
+    world_size: int = 1,
+    max_grad_norm: float = 1.0,
+    profile_batches: int = 0,
+    log_fn: Any | None = None,
+    encoder_only: bool = False,
+    *,
+    gene_loss_weights: dict[str, float] | None = None,
+    gene_cross_track_weight: float = 5.0,
+    strand_channel_masks: dict[str, Tensor] | None = None,
+    organism: int = 0,
+) -> tuple[float, dict[str, float]]:
+    """Train for one epoch with sequence parallelism.
+
+    Splits the input sequence across GPUs instead of splitting the batch (DDP).
+    This enables training on longer sequences by keeping per-GPU memory constant
+    regardless of world size.
+
+    Follows the same structure as train_epoch_multihead, replacing the backbone
+    forward pass with sequence_parallel.forward() which performs the distributed
+    encode step and returns per-rank local embeddings in NCL format.
+
+    Args:
+        model: AlphaGenome model (may be DDP-wrapped).
+        heads: Dict mapping modality name to output head module.
+        train_loader: Training data loader (yields sequences, modality_targets).
+        optimizer: Optimizer.
+        scheduler: Learning rate scheduler.
+        device: Torch device.
+        modality_weights: Weight for each modality's loss.
+        resolution_weights: Per-modality resolution weights dict.
+        positional_weight: Weight for positional component of multinomial loss.
+        count_weight: Weight for count component of multinomial loss.
+        sequence_parallel: SequenceParallelism instance.
+        epoch: Current epoch number.
+        log_every: Log frequency in steps.
+        use_amp: Whether to use automatic mixed precision.
+        accumulation_steps: Number of batches to accumulate gradients over.
+        frozen_backbone: If True, run backbone under torch.no_grad().
+        num_segments: Number of segments for multinomial loss.
+        min_segment_size: Minimum segment size for multinomial loss.
+        train_sampler: DistributedSampler for shuffling across epochs.
+        rank: Process rank for DDP.
+        world_size: Total number of processes.
+        max_grad_norm: Maximum gradient norm for clipping.
+        profile_batches: Number of batches to profile (0 = disabled).
+        log_fn: Optional step logging function.
+        encoder_only: Not used in SP mode (full backbone always runs).
+
+    Returns:
+        Tuple of (avg_total_loss, per_modality_train_loss).
+    """
+    from alphagenome_pytorch.extensions.finetuning.distributed import (
+        is_main_process,
+        reduce_tensor,
+    )
+    from alphagenome_pytorch.sequence_parallel import SequenceParallelism
+
+    if not isinstance(sequence_parallel, SequenceParallelism):
+        raise ValueError("sequence_parallel must be a SequenceParallelism instance")
+
+    model_module = model.module if hasattr(model, "module") else model
+    model_module.train()
+
+    if train_sampler is not None:
+        train_sampler.set_epoch(epoch)
+
+    # Collect all needed resolutions across modalities (same as train_epoch_multihead)
+    all_resolutions: set[int] = set()
+    for modality in heads:
+        all_resolutions.update(resolution_weights.get(modality, {}).keys())
+    resolutions = tuple(all_resolutions)
+
+    total_loss_accum = 0.0
+    modality_loss_accum: dict[str, float] = {m: 0.0 for m in heads}
+    n_batches = 0
+    running_loss = 0.0
+    accumulated_batches = 0
+
+    if is_main_process(rank):
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch} [SP]")
+    else:
+        pbar = train_loader
+
+    gene_loss_weights = gene_loss_weights or {}
+
+    for batch_idx, batch_data in enumerate(pbar):
+        # Dataset returns 3-tuple when gene_mask is configured, else 2-tuple.
+        if len(batch_data) == 3:
+            sequences, modality_targets, gene_mask = batch_data
+            gene_mask = gene_mask.to(device)
+        else:
+            sequences, modality_targets = batch_data
+            gene_mask = None
+        sequences = sequences.to(device)
+        organism_idx = torch.full((sequences.shape[0],), organism, dtype=torch.long, device=device)
+
+        # Align sequence length to world_size * 128 for sequence parallelism.
+        # This ensures each rank's base shard size is divisible by 128, so the
+        # encoder's strided convolutions produce exact token counts.
+        # this will be triggered when the world_size is not a multiple of 2
+        if sequence_parallel is not None and world_size > 1:
+            pad_multiple = world_size * 128 * 16  # lowres length must also be divisible by 16 for pair updates
+            seq_len = sequences.shape[1]
+            padded_len = ((seq_len + pad_multiple - 1) // pad_multiple) * pad_multiple
+            if padded_len > seq_len:
+                n_pad = padded_len - seq_len
+                if rank == 0:  # Print warning only once per batch
+                    import warnings
+                    warnings.warn(
+                        f"Sequence length {seq_len} not divisible by {pad_multiple}. "
+                        f"Padding to {padded_len} (+{n_pad} bp) for sequence parallelism.",
+                        stacklevel=2
+                    )
+                sequences = torch.nn.functional.pad(sequences, (0, 0, 0, n_pad))  # pad (S, 4) on S dim
+
+        # ===== BACKBONE: sequence-parallel forward =====
+        # Returns embeddings_dict in NCL format - same as model.encode(channels_last=False)
+        original_length = seq_len if padded_len > seq_len else None
+
+        def _build_embeddings_dict(embeddings_1bp, embeddings_128bp, need_1bp_):
+            d = {128: embeddings_128bp}
+            if need_1bp_ and embeddings_1bp is not None:
+                d[1] = embeddings_1bp
+            return d
+
+        if frozen_backbone:
+            with torch.no_grad():
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                    embeddings_1bp, embeddings_128bp, embeddings_pair, need_1bp = sequence_parallel.forward(
+                        model=model_module,
+                        sequence=sequences,
+                        organism_index=organism_idx,
+                        resolutions=resolutions,
+                        original_length=original_length,
+                    )
+            embeddings_1bp = embeddings_1bp.detach() if embeddings_1bp is not None else None
+            embeddings_128bp = embeddings_128bp.detach()
+            embeddings_dict = _build_embeddings_dict(embeddings_1bp, embeddings_128bp, need_1bp)
+        else:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                embeddings_1bp, embeddings_128bp, embeddings_pair, need_1bp = sequence_parallel.forward(
+                    model=model_module,
+                    sequence=sequences,
+                    organism_index=organism_idx,
+                    resolutions=resolutions,
+                    original_length=original_length,
+                )
+            embeddings_dict = _build_embeddings_dict(embeddings_1bp, embeddings_128bp, need_1bp)
+
+        # ===== HEADS + LOSS (mirrors train_epoch_multihead exactly) =====
+        loss = torch.tensor(0.0, device=device)
+        loss_components: dict[str, float] = {}
+
+        for modality, head in heads.items():
+            if modality not in modality_targets:
+                continue
+
+            modality_weight = modality_weights.get(modality, 1.0)
+            res_weights = resolution_weights.get(modality, {})
+            targets_dict = modality_targets[modality]
+
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                # contact_maps head takes embeddings_pair directly; all other
+                # GenomeTracksHead variants take embeddings_dict.
+                if modality == "contact_maps":
+                    predictions = head(
+                        embeddings_pair, organism_idx, channels_last=True
+                    )
+                else:
+                    predictions = head(
+                        embeddings_dict, organism_idx, return_scaled=True, channels_last=True
+                    )
+
+            modality_loss = torch.tensor(0.0, device=device)
+
+            for res, weight in res_weights.items():
+                if res not in predictions or res not in targets_dict:
+                    continue
+
+                pred = predictions[res]
+                targets = targets_dict[res].to(device)
+
+                # Slice targets to match local shard for this rank (sequence parallel).
+                # Targets are at their native resolution (e.g. S_full for 1bp,
+                # S_full//128 for 128bp), so a single split by world_size works
+                # regardless of resolution.
+                full_len = targets.shape[1]
+                local_len = full_len // world_size
+                t_start = rank * local_len
+                targets = targets[:, t_start:t_start + local_len, :]
+
+                head_module = head.module if hasattr(head, "module") else head
+                targets = head_module.scale(
+                    targets, organism_idx, resolution=res, channels_last=True
+                )
+                mask = torch.ones(pred.shape[0], 1, pred.shape[-1], dtype=torch.bool, device=device)
+
+                current_seq_len = pred.shape[-2]
+                multinomial_res = _compute_multinomial_resolution(
+                    current_seq_len, num_segments, min_segment_size
+                )
+
+                loss_dict = multinomial_loss(
+                    y_pred=pred,
+                    y_true=targets,
+                    mask=mask,
+                    multinomial_resolution=multinomial_res,
+                    positional_weight=positional_weight,
+                    count_weight=count_weight,
+                    channels_last=True,
+                )
+
+                res_loss = loss_dict["loss"] * weight
+
+                # Optional gene LFC term (Decima-style cross-track loss) for
+                # the rna_seq head at 1bp resolution. Slice gene_mask along
+                # S to match this rank's local shard, exactly as we sliced
+                # targets above.
+                gene_w = gene_loss_weights.get(modality, 0.0)
+                if (
+                    res == 1
+                    and gene_w > 0
+                    and gene_mask is not None
+                    and strand_channel_masks is not None
+                    and modality in strand_channel_masks
+                ):
+                    g_full_len = gene_mask.shape[1]
+                    g_local_len = g_full_len // world_size
+                    g_start = rank * g_local_len
+                    local_gene_mask = gene_mask[
+                        :, g_start:g_start + g_local_len, :, :
+                    ]
+                    gene_loss, gene_aux = losses.gene_lfc_loss(
+                        predictions=pred,
+                        targets=targets,
+                        targets_mask=mask,
+                        gene_mask=local_gene_mask,
+                        strand_channel_mask=strand_channel_masks[modality],
+                        gene_cross_track_weight=gene_cross_track_weight,
+                    )
+                    res_loss = res_loss + weight * gene_w * gene_loss
+                    loss_components[f"{modality}_gene_lfc"] = gene_loss.item()
+                    loss_components[f"{modality}_gene_total_count"] = gene_aux["gene_loss_total_count"].item()
+                    loss_components[f"{modality}_gene_positional"] = gene_aux["gene_loss_positional"].item()
+
+                modality_loss = modality_loss + res_loss
+                loss_components[f"{modality}_loss_{res}bp"] = res_loss.item()
+
+            weighted_modality_loss = modality_loss * modality_weight
+            loss = loss + weighted_modality_loss
+            loss_components[f"{modality}_loss"] = modality_loss.item()
+            modality_loss_accum[modality] += modality_loss.item()
+
+        # ===== BACKWARD + OPTIMIZER =====
+        scaled_loss = loss / accumulation_steps
+        scaled_loss.backward()
+
+        is_accumulation_step = (batch_idx + 1) % accumulation_steps == 0
+        is_last_batch = batch_idx == len(train_loader) - 1
+
+        if is_accumulation_step or is_last_batch:
+            # Sequence parallelism bypasses DDP's forward() so its allreduce hook
+            # never fires. Manually allreduce gradients so all ranks apply the same
+            # parameter update.
+            if world_size > 1:
+                trainable_params = []
+                for head in heads.values():
+                    trainable_params.extend([p for p in head.parameters() if p.requires_grad])
+                trainable_params.extend([p for p in model.parameters() if p.requires_grad])
+                for p in trainable_params:
+                    if p.grad is not None:
+                        dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+
+            trainable_params = []
+            for head in heads.values():
+                trainable_params.extend([p for p in head.parameters() if p.requires_grad])
+            trainable_params.extend([p for p in model.parameters() if p.requires_grad])
+
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=max_grad_norm)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+
+        # ===== LOGGING =====
+        raw_loss = loss.item()
+        total_loss_accum += raw_loss
+        n_batches += 1
+        running_loss += raw_loss
+        accumulated_batches += 1
+
+        current_lr = scheduler.get_last_lr()[0]
+
+        if is_main_process(rank) and batch_idx % log_every == 0:
+            avg_running_loss = running_loss / accumulated_batches
+            if hasattr(pbar, "set_postfix"):
+                pbar.set_postfix({
+                    "loss": f"{raw_loss:.4f}",
+                    "run_loss": f"{avg_running_loss:.4f}",
+                    "lr": f"{current_lr:.2e}",
+                })
+
+            if log_fn is not None:
+                log_fn({
+                    "batch": batch_idx,
+                    "epoch": epoch,
+                    "loss": raw_loss,
+                    "running_loss": avg_running_loss,
+                    "learning_rate": current_lr,
+                    **loss_components,
+                })
+
+            running_loss = 0.0
+            accumulated_batches = 0
+
+    # Reduce across processes
+    avg_loss = total_loss_accum / max(1, n_batches)
+    per_modality_loss = {m: v / max(1, n_batches) for m, v in modality_loss_accum.items()}
+
+    if world_size > 1:
+        avg_loss_tensor = torch.tensor(avg_loss, device=device)
+        avg_loss_tensor = reduce_tensor(avg_loss_tensor, world_size)
+        avg_loss = avg_loss_tensor.item()
+
+        for m in per_modality_loss:
+            m_tensor = torch.tensor(per_modality_loss[m], device=device)
+            m_tensor = reduce_tensor(m_tensor, world_size)
+            per_modality_loss[m] = m_tensor.item()
+
+    return avg_loss, per_modality_loss
+
+
 __all__ = [
     "collate_genomic",
     "ModalityConfig",
@@ -1638,4 +2149,6 @@ __all__ = [
     # Multi-head training
     "train_epoch_multihead",
     "validate_multihead",
+    # Sequence parallel training
+    "train_epoch_sequence_parallel",
 ]
