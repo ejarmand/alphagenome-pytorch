@@ -12,10 +12,13 @@ import torch
 # Import script module symbols directly (tests run from repository root)
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "scripts"))
 
+import finetune as finetune_module  # noqa: E402
 from finetune import (  # noqa: E402
     MultimodalDataset,
     collate_multimodal,
+    load_track_metadata_for_finetune,
     parse_args,
+    unwrap_training_model,
 )
 from alphagenome_pytorch.extensions.finetuning.training import (  # noqa: E402
     _compute_multinomial_resolution,
@@ -140,6 +143,121 @@ class TestParseArgsMultimodal:
 
 
 @pytest.mark.unit
+class TestParseArgsStrandPairs:
+    """Tests for --strand-pairs / config strand_pairs parsing."""
+
+    def _stranded_argv(self, *extra: str) -> list[str]:
+        return (
+            _required_cli_args()
+            + [
+                "--modality", "atac", "--bigwig", "atac1.bw", "atac2.bw",
+                "--modality", "rna_seq", "--bigwig",
+                "rp1.bw", "rm1.bw", "rp2.bw", "rm2.bw",
+            ]
+            + list(extra)
+        )
+
+    def test_auto_pairs_consecutive_and_leaves_others_none(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", self._stranded_argv("--strand-pairs", "rna_seq:auto"))
+        args = parse_args()
+        assert args.modality_strand_pairs["rna_seq"] == [(0, 1), (2, 3)]
+        # Unstranded modality is untouched.
+        assert args.modality_strand_pairs["atac"] is None
+
+    def test_explicit_string_pairs(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", self._stranded_argv("--strand-pairs", "rna_seq:0,2;1,3"))
+        args = parse_args()
+        assert args.modality_strand_pairs["rna_seq"] == [(0, 2), (1, 3)]
+
+    def test_no_strand_pairs_all_none(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", self._stranded_argv())
+        args = parse_args()
+        assert args.modality_strand_pairs["atac"] is None
+        assert args.modality_strand_pairs["rna_seq"] is None
+
+    def test_auto_rejects_odd_bigwig_count(self, monkeypatch):
+        # atac has 2 bigwigs (even); point auto at a modality with an odd count.
+        argv = (
+            _required_cli_args()
+            + ["--modality", "rna_seq", "--bigwig", "rp1.bw", "rm1.bw", "rp2.bw"]
+            + ["--strand-pairs", "rna_seq:auto"]
+        )
+        monkeypatch.setattr(sys, "argv", argv)
+        with pytest.raises(SystemExit):
+            parse_args()
+
+    def test_rejects_unknown_modality(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", self._stranded_argv("--strand-pairs", "cage:auto"))
+        with pytest.raises(SystemExit):
+            parse_args()
+
+    @pytest.mark.parametrize("spec", ["rna_seq:", "rna_seq:;", "rna_seq: ; "])
+    def test_rejects_empty_explicit_spec(self, monkeypatch, spec):
+        # A blank explicit spec is almost certainly a typo: reject rather than
+        # silently apply no averaging.
+        monkeypatch.setattr(sys, "argv", self._stranded_argv("--strand-pairs", spec))
+        with pytest.raises(SystemExit):
+            parse_args()
+
+    def test_rejects_empty_config_list(self, monkeypatch, tmp_path):
+        yaml = pytest.importorskip("yaml")
+        config = {
+            "modalities": {
+                "rna_seq": {"bigwig": ["rp1.bw", "rm1.bw"], "strand_pairs": []},
+            }
+        }
+        config_path = tmp_path / "train.yaml"
+        config_path.write_text(yaml.safe_dump(config))
+        monkeypatch.setattr(
+            sys, "argv", _required_cli_args() + ["--config", str(config_path)]
+        )
+        with pytest.raises(SystemExit):
+            parse_args()
+
+    def test_config_list_of_lists(self, monkeypatch, tmp_path):
+        yaml = pytest.importorskip("yaml")
+        config = {
+            "modalities": {
+                "atac": {"bigwig": ["atac1.bw", "atac2.bw"]},
+                "rna_seq": {
+                    "bigwig": ["rp1.bw", "rm1.bw", "rp2.bw", "rm2.bw"],
+                    "strand_pairs": [[0, 1], [2, 3]],
+                },
+            }
+        }
+        config_path = tmp_path / "train.yaml"
+        config_path.write_text(yaml.safe_dump(config))
+        monkeypatch.setattr(
+            sys, "argv", _required_cli_args() + ["--config", str(config_path)]
+        )
+        args = parse_args()
+        assert args.modality_strand_pairs["rna_seq"] == [(0, 1), (2, 3)]
+        assert args.modality_strand_pairs["atac"] is None
+
+    def test_cli_overrides_config_strand_pairs(self, monkeypatch, tmp_path):
+        yaml = pytest.importorskip("yaml")
+        config = {
+            "modalities": {
+                "rna_seq": {
+                    "bigwig": ["rp1.bw", "rm1.bw", "rp2.bw", "rm2.bw"],
+                    "strand_pairs": "auto",
+                },
+            }
+        }
+        config_path = tmp_path / "train.yaml"
+        config_path.write_text(yaml.safe_dump(config))
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            _required_cli_args()
+            + ["--config", str(config_path), "--strand-pairs", "rna_seq:0,2;1,3"],
+        )
+        args = parse_args()
+        # CLI explicit pairs win over config 'auto'.
+        assert args.modality_strand_pairs["rna_seq"] == [(0, 2), (1, 3)]
+
+
+@pytest.mark.unit
 class TestMultimodalDataset:
     """Tests for MultimodalDataset wrapper."""
 
@@ -249,3 +367,138 @@ class TestCollateMultimodal:
         assert torch.equal(sequences[1], seq2)
         assert torch.equal(modality_targets["atac"][128][0], targets1)
         assert torch.equal(modality_targets["atac"][128][1], targets2)
+
+
+@pytest.mark.unit
+class TestUnwrapTrainingModel:
+    """Tests for finetune.py wrapper unwrapping."""
+
+    def test_unwraps_compile_wrapper(self):
+        base = torch.nn.Linear(4, 4)
+
+        class FakeCompiled(torch.nn.Module):
+            def __init__(self, module):
+                super().__init__()
+                self._orig_mod = module
+
+        wrapped = FakeCompiled(base)
+
+        assert unwrap_training_model(wrapped) is base
+
+    def test_unwraps_compile_then_ddp(self, monkeypatch):
+        base = torch.nn.Linear(4, 4)
+
+        class FakeDDP(torch.nn.Module):
+            def __init__(self, module):
+                super().__init__()
+                self.module = module
+
+        class FakeCompiled(torch.nn.Module):
+            def __init__(self, module):
+                super().__init__()
+                self._orig_mod = module
+
+        monkeypatch.setattr(finetune_module, "DDP", FakeDDP)
+        wrapped = FakeCompiled(FakeDDP(base))
+
+        assert unwrap_training_model(wrapped) is base
+
+
+@pytest.mark.unit
+class TestLoadTrackMetadataForFinetune:
+    """Tests for --track-metadata loading/validation/embedding."""
+
+    @staticmethod
+    def _write_csv(path: Path, lines: list[str]) -> None:
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def test_none_path_returns_unchanged(self):
+        names = {"atac": ["a", "b"]}
+        out_names, rows = load_track_metadata_for_finetune(None, names, rank=0)
+        assert out_names is names
+        assert rows is None
+
+    def test_happy_path_overrides_names_and_embeds_rows(self, tmp_path):
+        csv = tmp_path / "meta.csv"
+        self._write_csv(csv, [
+            "organism,output_type,track_name,biosample_name",
+            "human,atac,liver,Liver",
+            "human,atac,brain,Brain",
+        ])
+        out_names, rows = load_track_metadata_for_finetune(
+            str(csv), {"atac": ["bw0", "bw1"]}, rank=0,
+        )
+        assert out_names == {"atac": ["liver", "brain"]}
+        assert [r["track_name"] for r in rows] == ["liver", "brain"]
+
+    def test_count_mismatch_raises(self, tmp_path):
+        csv = tmp_path / "meta.csv"
+        self._write_csv(csv, [
+            "organism,output_type,track_name",
+            "human,atac,liver",
+        ])
+        with pytest.raises(ValueError, match="Counts must match"):
+            load_track_metadata_for_finetune(str(csv), {"atac": ["bw0", "bw1"]}, rank=0)
+
+    def test_mouse_tracks_embed_under_organism_one(self, tmp_path):
+        """--organism mouse validates and embeds mouse (organism=1) tracks."""
+        csv = tmp_path / "meta.csv"
+        self._write_csv(csv, [
+            "organism,output_type,track_name",
+            "mouse,atac,liver",
+            "mouse,atac,brain",
+        ])
+        out_names, rows = load_track_metadata_for_finetune(
+            str(csv), {"atac": ["bw0", "bw1"]}, rank=0, organism="mouse",
+        )
+        assert out_names == {"atac": ["liver", "brain"]}
+        assert all(int(r["organism"]) == 1 for r in rows)
+
+    def test_mouse_tracks_without_organism_flag_raise(self, tmp_path):
+        """Mouse-tagged tracks without --organism mouse must raise (the trainer
+        would otherwise forward at the human embedding)."""
+        csv = tmp_path / "meta.csv"
+        self._write_csv(csv, [
+            "organism,output_type,track_name",
+            "mouse,atac,liver",
+            "mouse,atac,brain",
+        ])
+        with pytest.raises(ValueError, match="trains organism 0"):
+            load_track_metadata_for_finetune(str(csv), {"atac": ["bw0", "bw1"]}, rank=0)
+
+    def test_organism_flag_conflicts_with_parquet_raises(self, tmp_path):
+        """--organism mouse but human-tagged parquet -> clear error."""
+        csv = tmp_path / "meta.csv"
+        self._write_csv(csv, [
+            "organism,output_type,track_name",
+            "human,atac,liver",
+            "human,atac,brain",
+        ])
+        with pytest.raises(ValueError, match="trains organism 1"):
+            load_track_metadata_for_finetune(
+                str(csv), {"atac": ["bw0", "bw1"]}, rank=0, organism="mouse",
+            )
+
+    def test_mixed_organism_not_supported(self, tmp_path):
+        """A mixed human+mouse catalog is rejected (single-organism fine-tune)."""
+        csv = tmp_path / "meta.csv"
+        self._write_csv(csv, [
+            "organism,output_type,track_name",
+            "human,atac,liver",
+            "mouse,atac,m_liver",
+        ])
+        with pytest.raises(ValueError, match="not supported yet"):
+            load_track_metadata_for_finetune(str(csv), {"atac": ["bw0", "bw1"]}, rank=0)
+
+    def test_organism_flag_fills_missing_column(self, tmp_path):
+        """--organism mouse fills rows lacking an 'organism' value -> organism 1."""
+        csv = tmp_path / "meta.csv"
+        self._write_csv(csv, [
+            "output_type,track_name",
+            "atac,liver",
+            "atac,brain",
+        ])
+        _names, rows = load_track_metadata_for_finetune(
+            str(csv), {"atac": ["bw0", "bw1"]}, rank=0, organism="mouse",
+        )
+        assert all(int(r["organism"]) == 1 for r in rows)

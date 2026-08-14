@@ -16,6 +16,12 @@ from alphagenome_pytorch.extensions.finetuning.data_transforms import (
     DEFAULT_SOFT_CLIP_THRESHOLD,
     DEFAULT_TOTAL_COUNT,
 )
+from alphagenome_pytorch.utils.sequence import (
+    reverse_complement_onehot,
+    reverse_complement_onehot_tensor,
+    shift_onehot,
+    shift_onehot_tensor,
+)
 
 
 class TestNormalizeToTotal:
@@ -191,3 +197,45 @@ class TestApplyRnaseqTransforms:
         # After mean normalize: [0, 1.0]
         # After power 0.75: [0, 1.0^0.75] = [0, 1.0]
         assert np.allclose(result, [0.0, 1.0])
+
+
+def test_reverse_complement_onehot_numpy_and_torch():
+    x = np.array(
+        [
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+            [0, 0, 0, 1],
+        ],
+        dtype=np.float32,
+    )
+    expected = np.array(
+        [
+            [1, 0, 0, 0],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1],
+        ],
+        dtype=np.float32,
+    )
+
+    np.testing.assert_array_equal(reverse_complement_onehot(x), expected)
+    torch.testing.assert_close(
+        reverse_complement_onehot_tensor(torch.from_numpy(x)),
+        torch.from_numpy(expected),
+    )
+
+
+def test_shift_onehot_numpy_and_torch():
+    x = np.arange(20, dtype=np.float32).reshape(5, 4)
+    expected_right = np.vstack([np.zeros((2, 4), dtype=np.float32), x[:-2]])
+    expected_left = np.vstack([x[2:], np.zeros((2, 4), dtype=np.float32)])
+
+    np.testing.assert_array_equal(shift_onehot(x, 2), expected_right)
+    np.testing.assert_array_equal(shift_onehot(x, -2), expected_left)
+    torch.testing.assert_close(
+        shift_onehot_tensor(torch.from_numpy(x), 2),
+        torch.from_numpy(expected_right),
+    )
+    torch.testing.assert_close(
+        shift_onehot_tensor(torch.from_numpy(x), -2),
+        torch.from_numpy(expected_left),
+    )

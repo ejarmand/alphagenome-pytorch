@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Unified AlphaGenome training script.
 
-Supports: linear probing, LoRA, full finetuning, encoder-only.
+Supports: linear probing, LoRA, Locon, LoRA+Locon, full finetuning, encoder-only.
 Features: DDP, resume, preemption handling, W&B, profiling, multi-modality.
 
 Usage:
@@ -16,6 +16,17 @@ Usage:
     # LoRA finetuning (single modality)
     python scripts/finetune.py --mode lora \\
         --lora-rank 8 --lora-alpha 16 \\
+        --genome hg38.fa \\
+        --modality atac --bigwig *.bw \\
+        --train-bed train.bed --val-bed val.bed \\
+        --pretrained-weights model.pth \\
+        --resolutions 1
+
+    # LoRA + Locon finetuning (Baskerville-style Locon parity)
+    python scripts/finetune.py --mode lora+locon \\
+        --lora-rank 8 --lora-alpha 16 \\
+        --locon-rank 4 --locon-alpha 1 \\
+        --locon-targets down_blocks.4,down_blocks.5 \\
         --genome hg38.fa \\
         --modality atac --bigwig *.bw \\
         --train-bed train.bed --val-bed val.bed \\
@@ -81,6 +92,8 @@ torch._dynamo.config.suppress_errors = True
 # AlphaGenome imports
 from alphagenome_pytorch import AlphaGenome
 from alphagenome_pytorch.config import DtypePolicy
+from alphagenome_pytorch.named_outputs import TrackMetadataCatalog
+from alphagenome_pytorch.sequence_parallel import SequenceParallelism
 from alphagenome_pytorch.extensions.finetuning import (
     # Data
     CachedGenome,
@@ -94,10 +107,9 @@ from alphagenome_pytorch.extensions.finetuning import (
     TransferConfig,
     # Training
     create_lr_scheduler,
-    train_epoch_ddp,
-    validate_ddp,
     train_epoch_multihead,
     validate_multihead,
+    train_epoch_sequence_parallel,
     # Distributed
     setup_distributed,
     cleanup_distributed,
@@ -122,6 +134,8 @@ from alphagenome_pytorch.extensions.finetuning.transfer import (
     remove_all_heads,
     add_head,
     prepare_for_transfer,
+    validate_locon_targets,
+    transfer_config_to_dict,
 )
 
 
@@ -134,10 +148,12 @@ DEFAULTS = {
     "sequence_length": 131072,
     "resolutions": "1",
     # Model
-    "modality": "atac",
     "lora_rank": 8,
     "lora_alpha": 16,
     "lora_targets": "q_proj,v_proj",
+    "locon_rank": 4,
+    "locon_alpha": 1,
+    "locon_targets": "",
     # Training
     "epochs": 10,
     "batch_size": 1,
@@ -162,11 +178,108 @@ DEFAULTS = {
 
 
 # =============================================================================
+# Utilities
+# =============================================================================
+
+
+def unwrap_training_model(model: nn.Module) -> nn.Module:
+    """Unwrap the exact wrapper stack used in this training script.
+
+    Wrapping order in finetune.py is deterministic:
+    1. base model
+    2. optional DDP
+    3. optional torch.compile
+    """
+    inner = getattr(model, "_orig_mod", model)
+    if isinstance(inner, DDP):
+        return inner.module
+    return inner
+
+
+# =============================================================================
 # CLI
 # =============================================================================
 
 
-def parse_args() -> argparse.Namespace:
+def _normalize_strand_pairs(
+    raw: object,
+    n_bigwigs: int,
+    modality: str,
+    parser: argparse.ArgumentParser,
+) -> list[tuple[int, int]] | None:
+    """Normalize a strand-pair spec into [(plus_idx, minus_idx), ...].
+
+    Accepts three forms (indices are 0-based into that modality's bigwig list):
+      - 'auto'            : pair consecutive bigwigs (0,1),(2,3),... (needs even count)
+      - 'p,m;p,m;...'     : CLI string of explicit pairs
+      - [[p, m], ...]     : config list-of-lists of explicit pairs
+
+    Index validity (bounds, distinctness, no reuse) is enforced downstream by
+    compute_track_means; this only handles syntax and the 'auto' expansion.
+    """
+    if raw is None:
+        return None
+    if raw == "auto":
+        if n_bigwigs % 2 != 0:
+            parser.error(
+                f"strand_pairs 'auto' for '{modality}' needs an even number of "
+                f"bigwigs; got {n_bigwigs}"
+            )
+        return [(i, i + 1) for i in range(0, n_bigwigs, 2)]
+    if isinstance(raw, str):
+        chunks = [c for c in (s.strip() for s in raw.split(";")) if c]
+        try:
+            pairs = [tuple(int(x) for x in c.split(",")) for c in chunks]
+        except ValueError:
+            parser.error(
+                f"strand_pairs for '{modality}' must be 'plus,minus' pairs; "
+                f"got {raw!r}"
+            )
+    elif isinstance(raw, (list, tuple)):
+        try:
+            pairs = [tuple(int(x) for x in pair) for pair in raw]
+        except (TypeError, ValueError):
+            parser.error(
+                f"strand_pairs for '{modality}' must be a list of [plus, minus] "
+                f"pairs; got {raw!r}"
+            )
+    else:
+        parser.error(f"strand_pairs for '{modality}' has unsupported type: {type(raw)}")
+    if not pairs:
+        parser.error(
+            f"strand_pairs for '{modality}' is empty; specify 'auto' or at least "
+            f"one 'plus,minus' pair, or omit it entirely to keep per-track means"
+        )
+    for pair in pairs:
+        if len(pair) != 2:
+            parser.error(
+                f"strand_pairs for '{modality}' must contain exactly two indices "
+                f"per pair; got {pair!r}"
+            )
+    return pairs
+
+
+def _parse_cli_strand_pairs(
+    spec: str | None,
+    modalities: list[str],
+    parser: argparse.ArgumentParser,
+) -> dict[str, str]:
+    """Parse '--strand-pairs' into {modality: raw_pairs_string} (unnormalized)."""
+    result: dict[str, str] = {}
+    if not spec:
+        return result
+    for entry in spec.split():
+        if ":" not in entry:
+            parser.error(f"--strand-pairs entry must be 'modality:pairs'; got {entry!r}")
+        modality, pairs_str = entry.split(":", 1)
+        modality = modality.strip()
+        if modality not in modalities:
+            parser.error(f"Unknown modality in --strand-pairs: {modality!r}")
+        result[modality] = pairs_str.strip()
+    return result
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
         description="Unified AlphaGenome training script",
@@ -184,12 +297,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["linear-probe", "lora", "full", "encoder-only"],
+        choices=["linear-probe", "lora", "locon", "lora+locon", "full", "encoder-only"],
         default="lora",
         help=(
             "Training mode: "
             "'linear-probe' (frozen backbone, train heads on full transformer embeddings), "
             "'lora' (LoRA adapters + heads), "
+            "'locon' (Locon adapters on convolutional layers + heads), "
+            "'lora+locon' (LoRA on transformer targets plus Locon on convolutional targets + heads), "
             "'full' (all parameters), "
             "'encoder-only' (frozen backbone, train heads on raw CNN encoder output at 128bp; "
             "supports short sequences such as MPRA; forces --resolutions 128)"
@@ -209,6 +324,34 @@ def parse_args() -> argparse.Namespace:
     )
     data.add_argument("--train-bed", type=str, required=False, help="Training positions BED")
     data.add_argument("--val-bed", type=str, required=False, help="Validation positions BED")
+    data.add_argument(
+        "--track-metadata",
+        type=str,
+        default=None,
+        help=(
+            "Optional parquet/CSV/TSV with rich track metadata "
+            "(ontology_curie, biosample_name, assay_title, ...). "
+            "Embedded into checkpoints and exported delta weights so "
+            "served models populate /v1/output_metadata without "
+            "re-supplying --track-metadata at serve time. The 'output_type' "
+            "column must match the head name (= --modality)."
+        ),
+    )
+    data.add_argument(
+        "--organism",
+        type=str,
+        choices=["human", "mouse"],
+        default=None,
+        help=(
+            "Organism for the fine-tuning tracks when they all share one "
+            "(human=0, mouse=1). Applied as the default for --track-metadata "
+            "rows that lack an 'organism' value. For mixed human+mouse tracks, "
+            "omit this and set a per-track 'organism' column in the parquet "
+            "instead (it is authoritative). If --organism is given but the "
+            "parquet declares a different or mixed set of organisms, "
+            "fine-tuning errors out. Defaults to human (organism 0)."
+        ),
+    )
     data.add_argument("--sequence-length", type=int, default=DEFAULTS["sequence_length"])
     data.add_argument(
         "--resolutions",
@@ -231,6 +374,68 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=16,
         help="Max threads for parallel BigWig I/O (default: 16)",
+    )
+    data.add_argument(
+        "--gtf",
+        type=str,
+        default=None,
+        help=(
+            "Path to a GTF annotation file (Gencode-compatible). Required when "
+            "--gene-loss-weight > 0. The GTF is parsed via pyranges and the "
+            "protein_coding gene rows are used to build per-window gene masks."
+        ),
+    )
+    data.add_argument(
+        "--track-strands",
+        type=str,
+        default=None,
+        help=(
+            "Per-track strand string for the rna_seq modality, one char per "
+            "BigWig in order. Each char must be '+', '-', or '.'. "
+            "Compact ('+-+-') or separated ('+,-,+,-' / '+ - + -') forms "
+            "are both accepted; commas and whitespace are stripped. "
+            "Required when --gene-loss-weight > 0. Can also be supplied via "
+            "the YAML config under modalities.<head>.strand."
+        ),
+    )
+    data.add_argument(
+        "--strand-pairs",
+        type=str,
+        default=None,
+        help=(
+            "Average +/- strand track means so paired strands share a scaling "
+            "factor (recommended for stranded RNA-seq/CAGE/PRO-cap). Format: "
+            "space-separated 'modality:pairs', where pairs is either 'auto' "
+            "(pair consecutive bigwigs: (0,1),(2,3),...) or semicolon-separated "
+            "'plus,minus' index pairs. Examples: --strand-pairs 'rna_seq:auto' "
+            "or --strand-pairs 'rna_seq:0,1;2,3 cage:0,1'. Indices are 0-based "
+            "into that modality's --bigwig list. Overrides per-modality "
+            "'strand_pairs' from --config."
+        ),
+    )
+
+    # Gene LFC loss arguments (Decima-style cross-track loss for RNA-seq).
+    gene_lfc = parser.add_argument_group("Gene LFC loss")
+    gene_lfc.add_argument(
+        "--gene-loss-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Outer weight on the cross-track gene LFC loss for the rna_seq "
+            "head (paper value: 0.1). Default 0.0 disables the term entirely "
+            "and keeps loss values bit-identical to pre-B3.2 behavior. "
+            "When > 0, requires --gtf, rna_seq in --modality, and "
+            "--track-strands (or modalities.rna_seq.strand in YAML)."
+        ),
+    )
+    gene_lfc.add_argument(
+        "--gene-cross-track-weight",
+        type=float,
+        default=5.0,
+        help=(
+            "Inner multinomial weight inside the gene LFC term (paper "
+            "default: 5.0). Only used when --gene-loss-weight > 0."
+        ),
     )
 
     # Model arguments
@@ -257,6 +462,17 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=DEFAULTS["lora_targets"],
         help="Comma-separated modules for LoRA",
+    )
+    model.add_argument("--locon-rank", type=int, default=DEFAULTS["locon_rank"], help="Locon rank (0 to disable)")
+    model.add_argument("--locon-alpha", type=int, default=DEFAULTS["locon_alpha"], help="Locon alpha scaling")
+    model.add_argument(
+        "--locon-targets",
+        type=str,
+        default=DEFAULTS["locon_targets"],
+        help=(
+            "Comma-separated modules for Locon (required when Locon is enabled). Examples: "
+            "'down_blocks.5' for Locon2, 'down_blocks.4,down_blocks.5' for Locon4."
+        ),
     )
     model.add_argument(
         "--dtype",
@@ -305,6 +521,20 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--compile", action="store_true", help="Use torch.compile")
     train.add_argument("--seed", type=int, default=None, help="Random seed")
 
+    # Distributed/Sequence Parallel arguments
+    dist = parser.add_argument_group("Distributed")
+    dist.add_argument(
+        "--sequence-parallel",
+        action="store_true",
+        help="Enable sequence parallelism (split sequence across GPUs)",
+    )
+    dist.add_argument(
+        "--overlap-highres",
+        type=int,
+        default=1024,
+        help="Overlap for high-resolution (1bp) sequence splits. Low-resolution overlap is computed as overlap_highres // 128.",
+    )
+
     # Logging arguments
     log = parser.add_argument_group("Logging")
     log.add_argument("--wandb", action="store_true", help="Enable W&B logging")
@@ -317,6 +547,7 @@ def parse_args() -> argparse.Namespace:
     out.add_argument("--output-dir", type=str, default=DEFAULTS["output_dir"])
     out.add_argument("--run-name", type=str, default=None)
     out.add_argument("--save-every", type=int, default=DEFAULTS["save_every"])
+    out.add_argument("--no-save-checkpoints", action="store_true", help="Skip saving model checkpoints (keeps logs/config)")
 
     # Resume arguments
     resume = parser.add_argument_group("Resume / Checkpointing")
@@ -329,14 +560,40 @@ def parse_args() -> argparse.Namespace:
     resume.add_argument(
         "--save-delta",
         action="store_true",
-        help="Save delta checkpoints (adapter + head weights only, much smaller). "
-             "Delta files saved as best_model.delta.pth",
+        help="Save delta checkpoints (adapter + head weights only, much smaller) "
+             "for both best-model and per-epoch saves, alongside full checkpoints.",
+    )
+    resume.add_argument(
+        "--no-full-checkpoint",
+        action="store_true",
+        help="Skip writing full checkpoints (best_model.pth, checkpoint_epoch*.pth). "
+             "Requires --save-delta so the run still produces loadable checkpoints.",
+    )
+    resume.add_argument(
+        "--export-transfer-config",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Export TransferConfig to JSON file at end of training. "
+             "Useful for loading full checkpoints in predict scripts.",
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    tokens = argv if argv is not None else sys.argv[1:]
+    if args.no_full_checkpoint and not args.save_delta:
+        parser.error(
+            "--no-full-checkpoint requires --save-delta (otherwise the run "
+            "would produce no loadable checkpoints)."
+        )
+    if args.save_delta and args.mode == "full":
+        parser.error(
+            "--save-delta cannot be used with --mode full: delta checkpoints "
+            "only store adapter/head/norm weights, so they would omit all "
+            "fine-tuning updates to the trunk."
+        )
     cli_flags = {
         token.split("=", 1)[0]
-        for token in sys.argv[1:]
+        for token in tokens
         if token.startswith("--")
     }
 
@@ -414,6 +671,9 @@ def parse_args() -> argparse.Namespace:
         "lora_rank",
         "lora_alpha",
         "lora_targets",
+        "locon_rank",
+        "locon_alpha",
+        "locon_targets",
         "dtype",
         "head_init_scheme",
         "gradient_checkpointing",
@@ -443,6 +703,11 @@ def parse_args() -> argparse.Namespace:
         "save_every",
         "resume",
         "modality_weights",
+        "track_metadata",
+        "gtf",
+        "track_strands",
+        "gene_loss_weight",
+        "gene_cross_track_weight",
     ):
         _apply_config_scalar(attr, config_data)
 
@@ -485,12 +750,27 @@ def parse_args() -> argparse.Namespace:
             )
         if "task_weight" in mod_cfg and mod_cfg["task_weight"] is not None:
             spec["task_weight"] = float(mod_cfg["task_weight"])
+        if "strand" in mod_cfg and mod_cfg["strand"] is not None:
+            strand_val = mod_cfg["strand"]
+            if isinstance(strand_val, list):
+                strand_val = "".join(str(s) for s in strand_val)
+            elif not isinstance(strand_val, str):
+                parser.error(
+                    f"modalities.{modality}.strand must be a string of "
+                    f"+/-/. characters or a list, got {type(strand_val).__name__}"
+                )
+            spec["strand"] = strand_val
+        if "strand_pairs" in mod_cfg and mod_cfg["strand_pairs"] is not None:
+            spec["strand_pairs"] = mod_cfg["strand_pairs"]
         modality_specs[modality] = spec
 
     cli_modality_to_bigwigs: dict[str, list[str]] = {}
     if args.bigwigs is not None:
         if args.modalities is None:
-            args.modalities = [DEFAULTS["modality"]]
+            parser.error(
+                "--modality is required when --bigwig is provided. "
+                f"Pass one of: {sorted(MODALITY_CONFIGS.keys())}."
+            )
         if len(args.modalities) != len(args.bigwigs):
             parser.error(
                 f"Number of --modality ({len(args.modalities)}) must match number of --bigwig groups ({len(args.bigwigs)}). "
@@ -522,9 +802,13 @@ def parse_args() -> argparse.Namespace:
         if not value:
             parser.error(f"{flag} is required (or provide it in --config)")
 
+    cli_strand_pairs = _parse_cli_strand_pairs(args.strand_pairs, args.modalities, parser)
+
     args.modality_to_bigwigs = {}
     args.modality_resolutions = {}
     args.modality_weight_dict = {}
+    args.modality_strands: dict[str, str] = {}
+    args.modality_strand_pairs = {}
     for modality in args.modalities:
         spec = modality_specs.get(modality, {})
         if "bigwig" not in spec or not spec["bigwig"]:
@@ -532,6 +816,61 @@ def parse_args() -> argparse.Namespace:
         args.modality_to_bigwigs[modality] = list(spec["bigwig"])
         args.modality_resolutions[modality] = spec.get("resolutions", args.global_resolutions)
         args.modality_weight_dict[modality] = float(spec.get("task_weight", 1.0))
+        if spec.get("strand"):
+            args.modality_strands[modality] = str(spec["strand"])
+        # CLI --strand-pairs overrides per-modality config 'strand_pairs'.
+        raw_pairs = cli_strand_pairs.get(modality, spec.get("strand_pairs"))
+        args.modality_strand_pairs[modality] = _normalize_strand_pairs(
+            raw_pairs, len(args.modality_to_bigwigs[modality]), modality, parser
+        )
+
+    # `--track-strands` CLI flag overrides any YAML strand for rna_seq.
+    if args.track_strands:
+        if "rna_seq" not in args.modality_to_bigwigs:
+            parser.error(
+                "--track-strands is only meaningful with --modality rna_seq, "
+                f"but modalities are: {sorted(args.modality_to_bigwigs)}"
+            )
+        args.modality_strands["rna_seq"] = args.track_strands
+
+    # Normalize and validate strand strings: accept both compact form
+    # ('+-+-.-') and comma/whitespace-separated form ('+,-,+,-,.,-' or
+    # '+ - + - . -'). After stripping separators, exactly one char per
+    # bigwig, each in {+, -, .}.
+    def _normalize_strand_string(s: str) -> str:
+        return "".join(c for c in s if c not in ", \t")
+
+    for modality, strands in list(args.modality_strands.items()):
+        strands = _normalize_strand_string(strands)
+        args.modality_strands[modality] = strands
+        n_bw = len(args.modality_to_bigwigs[modality])
+        if len(strands) != n_bw:
+            parser.error(
+                f"strand string for modality '{modality}' has {len(strands)} "
+                f"strand chars but there are {n_bw} bigwigs"
+            )
+        invalid = sorted({c for c in strands if c not in "+-."})
+        if invalid:
+            parser.error(
+                f"strand string for '{modality}' contains invalid chars "
+                f"{invalid}; allowed: '+', '-', '.'"
+            )
+
+    # Validate gene-LFC config consistency.
+    if args.gene_loss_weight > 0:
+        if not args.gtf:
+            parser.error("--gene-loss-weight > 0 requires --gtf")
+        if "rna_seq" not in args.modality_to_bigwigs:
+            parser.error(
+                "--gene-loss-weight > 0 requires rna_seq in --modality / config; "
+                f"got modalities: {sorted(args.modality_to_bigwigs)}"
+            )
+        if "rna_seq" not in args.modality_strands:
+            parser.error(
+                "--gene-loss-weight > 0 requires per-track strand info for "
+                "rna_seq. Pass --track-strands or set "
+                "modalities.rna_seq.strand in the config."
+            )
 
     if "--modality-weights" not in cli_flags:
         for mod, weight in _parse_weight_overrides(
@@ -598,45 +937,59 @@ def create_datasets(
             rank,
         )
 
-    if args.is_multimodal:
-        # Multi-modality: create per-modality datasets and wrap in MultimodalDataset
-        print_rank0("Creating multi-modality train datasets...", rank)
-        train_datasets = {}
-        val_datasets = {}
+    # Optional gene-mask extractor for the gene LFC training loss (B3.2).
+    # Only attached to the rna_seq dataset; gene_mask is sample-level so
+    # MultimodalDataset will propagate it to the batch.
+    gene_mask_extractor = None
+    g_max = None
+    if args.gene_loss_weight > 0:
+        from alphagenome_pytorch.extensions.finetuning.gene_annotation import (
+            GeneMaskExtractor,
+            cached_load_gene_table,
+            derive_g_max,
+        )
+        from alphagenome_pytorch.extensions.finetuning.datasets import (
+            _load_intervals_from_bed,
+        )
 
-        for modality, bigwigs in args.modality_to_bigwigs.items():
-            resolutions = args.modality_resolutions[modality]
-            train_datasets[modality] = GenomicDataset(
-                genome_fasta=genome,
-                bigwig_files=bigwigs,
-                bed_file=args.train_bed,
-                resolutions=resolutions,
-                sequence_length=args.sequence_length,
-                cache_genome=cache_genome,
-                cache_signals=cache_signals,
-                max_io_workers=max_io_workers,
-            )
-            val_datasets[modality] = GenomicDataset(
-                genome_fasta=genome,
-                bigwig_files=bigwigs,
-                bed_file=args.val_bed,
-                resolutions=resolutions,
-                sequence_length=args.sequence_length,
-                cache_genome=cache_genome,
-                cache_signals=cache_signals,
-                max_io_workers=max_io_workers,
-            )
+        print_rank0(f"Loading GTF for gene LFC loss: {args.gtf}", rank)
+        gene_table = cached_load_gene_table(args.gtf, filter_protein_coding=True)
+        gene_mask_extractor = GeneMaskExtractor(gene_table)
 
-        train_dataset = MultimodalDataset(train_datasets)
-        val_dataset = MultimodalDataset(val_datasets)
-    else:
-        # Single-modality: create simple GenomicDataset
-        modality = args.modalities[0]
-        bigwigs = args.modality_to_bigwigs[modality]
+        # Project the BED windows used by the dataset (after centering/expansion
+        # to args.sequence_length) so derive_g_max sees the same intervals
+        # GenomicDataset will request at __getitem__.
+        all_intervals: list[tuple[str, int, int]] = []
+        for bed in (args.train_bed, args.val_bed):
+            raw_intervals, _ = _load_intervals_from_bed(bed)
+            half_len = args.sequence_length // 2
+            for chrom, s, e in raw_intervals:
+                center = (s + e) // 2
+                all_intervals.append((chrom, center - half_len, center + half_len))
+        g_max = derive_g_max(gene_mask_extractor, all_intervals)
+        print_rank0(
+            f"Gene LFC: scanned {len(all_intervals)} intervals, g_max={g_max}",
+            rank,
+        )
+
+    # Always create MultimodalDataset (even for single modality) to have a unified interface
+    # This is required by train_epoch_sequence_parallel
+    print_rank0("Creating datasets...", rank)
+    train_datasets = {}
+    val_datasets = {}
+
+    for modality, bigwigs in args.modality_to_bigwigs.items():
         resolutions = args.modality_resolutions[modality]
-
-        print_rank0("Creating train dataset...", rank)
-        train_dataset = GenomicDataset(
+        # Attach the gene-mask extractor only to the modality that consumes
+        # the gene LFC loss (rna_seq today).
+        attach_gene_mask = (
+            gene_mask_extractor is not None
+            and modality == "rna_seq"
+            and args.gene_loss_weight > 0
+        )
+        gme = gene_mask_extractor if attach_gene_mask else None
+        gme_g_max = g_max if attach_gene_mask else None
+        train_datasets[modality] = GenomicDataset(
             genome_fasta=genome,
             bigwig_files=bigwigs,
             bed_file=args.train_bed,
@@ -645,10 +998,10 @@ def create_datasets(
             cache_genome=cache_genome,
             cache_signals=cache_signals,
             max_io_workers=max_io_workers,
+            gene_mask_extractor=gme,
+            g_max=gme_g_max,
         )
-
-        print_rank0("Creating validation dataset...", rank)
-        val_dataset = GenomicDataset(
+        val_datasets[modality] = GenomicDataset(
             genome_fasta=genome,
             bigwig_files=bigwigs,
             bed_file=args.val_bed,
@@ -657,11 +1010,101 @@ def create_datasets(
             cache_genome=cache_genome,
             cache_signals=cache_signals,
             max_io_workers=max_io_workers,
+            gene_mask_extractor=gme,
+            g_max=gme_g_max,
         )
+
+    train_dataset = MultimodalDataset(train_datasets)
+    val_dataset = MultimodalDataset(val_datasets)
 
     print_rank0(f"Train: {len(train_dataset):,}  Val: {len(val_dataset):,}", rank)
 
     return train_dataset, val_dataset, modality_track_names, args.modality_resolutions
+
+
+ORGANISM_NAME_TO_INDEX = {"human": 0, "mouse": 1}
+
+
+def organism_index_from_args(args: argparse.Namespace) -> int:
+    """Biological organism index (0=human, 1=mouse) this fine-tune trains.
+
+    Drives the forward pass: mouse data is forwarded at index 1 so it uses the
+    mouse organism embedding. Heads stay ``num_organisms=1`` (organism-agnostic)
+    and ignore the index, so no head capacity is wasted.
+    """
+    return ORGANISM_NAME_TO_INDEX.get(getattr(args, "organism", None) or "human", 0)
+
+
+def load_track_metadata_for_finetune(
+    path: str | None,
+    modality_track_names: dict[str, list[str]],
+    rank: int,
+    organism: str | None = None,
+) -> tuple[dict[str, list[str]], list[dict[str, Any]] | None]:
+    """Load and validate user-supplied track metadata for fine-tuning.
+
+    Returns ``(track_names, metadata_rows)``:
+
+    * ``track_names`` — possibly updated track-name dict (rows in the parquet
+      override BigWig stems so checkpoint and embedded catalog agree).
+    * ``metadata_rows`` — list-of-dicts ready for embedding into checkpoints,
+      or ``None`` when ``path`` is ``None``.
+
+    A fine-tune trains a single organism (the forward uses one organism
+    embedding, selected by ``--organism``), so the metadata must describe that
+    organism. ``organism`` (``"human"``/``"mouse"``, default human) is the
+    organism the heads are trained for; it fills rows whose parquet ``organism``
+    column is absent. If the parquet declares any *other* organism, that is a
+    mistake (mixed human+mouse training is not supported yet) and raises — this
+    also stops mouse data from being embedded while the trainer forwards at the
+    human embedding.
+
+    Validates that every fine-tuning head has a matching ``output_type`` in the
+    catalog with the right number of tracks. Head name == ``--modality`` by
+    convention in this script.
+    """
+    if path is None:
+        return modality_track_names, None
+
+    organism_index = ORGANISM_NAME_TO_INDEX.get(organism or "human", 0)
+    organism_name = "mouse" if organism_index == 1 else "human"
+    # The default fills rows whose 'organism' value is absent; a per-track
+    # 'organism' column wins (and must agree with --organism, checked below).
+    catalog = TrackMetadataCatalog.from_file(path, default_organism=organism_index)
+    print_rank0(f"Loaded track metadata from {path}", rank)
+
+    present = set(catalog.organisms)
+    if present - {organism_index}:
+        raise ValueError(
+            f"--track-metadata declares organism(s) {sorted(present)}, but this "
+            f"fine-tune trains organism {organism_index} ({organism_name}). "
+            "Fine-tuning is single-organism: set every row's 'organism' to match "
+            "--organism (use --organism mouse for mouse tracks). Mixed "
+            "human+mouse training is not supported yet."
+        )
+
+    updated_names: dict[str, list[str]] = {}
+    for head_name, bigwig_names in modality_track_names.items():
+        tracks = catalog.get_tracks(head_name, organism=organism_index)
+        if not tracks:
+            available = catalog.outputs(organism=organism_index)
+            raise ValueError(
+                f"--track-metadata has no entries for head/output '{head_name}'. "
+                f"Available outputs: {available}. The 'output_type' column "
+                "must match the head name (= --modality)."
+            )
+        if len(tracks) != len(bigwig_names):
+            raise ValueError(
+                f"--track-metadata has {len(tracks)} tracks for '{head_name}', "
+                f"but {len(bigwig_names)} BigWig file(s) were provided. "
+                "Counts must match."
+            )
+        updated_names[head_name] = [t.track_name for t in tracks]
+
+    # Embed all rows (all organism `organism_index` after the check above) so the
+    # served catalog labels the tracks with the correct organism.
+    metadata_rows = catalog.to_rows()
+    return updated_names, metadata_rows
 
 
 def create_dataloaders(
@@ -672,12 +1115,23 @@ def create_dataloaders(
     world_size: int,
     rank: int,
     is_multimodal: bool = False,
+    sequence_parallel_mode: bool = False,
 ) -> tuple[DataLoader, DataLoader, DistributedSampler | None, DistributedSampler | None]:
-    """Create data loaders with optional distributed samplers."""
-    train_sampler = DistributedSampler(train_dataset, shuffle=True) if world_size > 1 else None
-    val_sampler = DistributedSampler(val_dataset, shuffle=False) if world_size > 1 else None
+    """Create data loaders with optional distributed samplers.
 
-    collate_fn = collate_multimodal if is_multimodal else collate_genomic
+    Args:
+        sequence_parallel_mode: If True, use non-distributed sampler (all ranks see same data).
+    """
+    # In sequence-parallel mode, all ranks must process the same sequence (shards of it)
+    if sequence_parallel_mode:
+        train_sampler = None
+        val_sampler = None
+    else:
+        train_sampler = DistributedSampler(train_dataset, shuffle=True) if world_size > 1 else None
+        val_sampler = DistributedSampler(val_dataset, shuffle=False) if world_size > 1 else None
+
+    # Always use collate_multimodal since we now always use MultimodalDataset
+    collate_fn = collate_multimodal
 
     train_loader = DataLoader(
         train_dataset,
@@ -720,7 +1174,7 @@ def create_model(
     rank: int,
     world_size: int,
     local_rank: int,
-) -> tuple[nn.Module, dict[str, nn.Module], list[torch.nn.Parameter]]:
+) -> tuple[nn.Module, dict[str, nn.Module], list[torch.nn.Parameter], TransferConfig | None]:
     """Create and configure the model based on training mode.
 
     Args:
@@ -734,7 +1188,7 @@ def create_model(
         local_rank: Local rank for GPU assignment.
 
     Returns:
-        Tuple of (model, heads_dict, trainable_params).
+        Tuple of (model, heads_dict, trainable_params, transfer_config).
     """
     print_rank0(f"Loading pretrained model from {args.pretrained_weights}", rank)
 
@@ -762,37 +1216,49 @@ def create_model(
     # encoder-only mode forces 128bp resolution for all heads
     is_encoder_only = args.mode == "encoder-only"
 
-    # Create heads for each modality (after freeze, so they have requires_grad=True)
-    heads: dict[str, nn.Module] = {}
-    for modality, track_names in modality_track_names.items():
-        n_tracks = len(track_names)
-        track_means = modality_track_means.get(modality)
-        resolutions = modality_resolutions[modality]
-
-        head = create_finetuning_head(
-            assay_type=modality,
-            n_tracks=n_tracks,
-            resolutions=resolutions if not is_encoder_only else (128,),
-            num_organisms=1,
-            track_means=track_means,
-            init_scheme=args.head_init_scheme,
-            encoder_only=is_encoder_only,
-        )
-        add_head(model, modality, head)
-        heads[modality] = head
-        head_resolutions = (128,) if is_encoder_only else resolutions
-        print_rank0(f"Created {modality} head with {n_tracks} tracks at resolutions {head_resolutions}", rank)
-
-    # Build new_heads dict for TransferConfig (used for delta checkpoints)
+    # Build new_heads dict for TransferConfig (used for delta checkpoints).
+    # Heads stay single-organism (organism-agnostic): the organism only selects
+    # the trunk embedding in the forward, not a head weight slot.
     new_heads_config: dict[str, dict] = {}
-    for modality in heads:
+    for modality, track_names in modality_track_names.items():
         head_res = (128,) if is_encoder_only else modality_resolutions[modality]
         new_heads_config[modality] = {
             "modality": modality,
-            "num_tracks": len(modality_track_names[modality]),
+            "num_tracks": len(track_names),
             "resolutions": list(head_res),
             "encoder_only": is_encoder_only,
+            "track_means": modality_track_means.get(modality),
+            "num_organisms": 1,
+            "init_scheme": args.head_init_scheme,
         }
+
+    # Create heads directly except in active adapter modes, where
+    # prepare_for_transfer() constructs the actual trainable heads we want the
+    # optimizer to own.
+    heads: dict[str, nn.Module] = {}
+    has_active_adapters = (
+        (args.mode in {"lora", "lora+locon"} and args.lora_rank > 0)
+        or (args.mode in {"locon", "lora+locon"} and args.locon_rank > 0)
+    )
+    create_heads_directly = not has_active_adapters
+    if create_heads_directly:
+        for modality, track_names in modality_track_names.items():
+            head = create_finetuning_head(
+                assay_type=modality,
+                n_tracks=len(track_names),
+                resolutions=tuple(new_heads_config[modality]["resolutions"]),
+                num_organisms=1,
+                track_means=modality_track_means.get(modality),
+                init_scheme=args.head_init_scheme,
+                encoder_only=is_encoder_only,
+            )
+            add_head(model, modality, head)
+            heads[modality] = head
+            print_rank0(
+                f"Created {modality} head with {len(track_names)} tracks "
+                f"at resolutions {tuple(new_heads_config[modality]['resolutions'])}",
+                rank,
+            )
 
     # Configure trainable params based on mode
     trainable_params: list[torch.nn.Parameter] = []
@@ -814,37 +1280,67 @@ def create_model(
         transfer_config = TransferConfig(mode="encoder-only", new_heads=new_heads_config)
         print_rank0("Mode: encoder-only (frozen backbone, raw CNN encoder output to head)", rank)
 
-    elif args.mode == "lora":
-        if args.lora_rank > 0:
-            lora_targets = [t.strip() for t in args.lora_targets.split(",")]
+    elif args.mode in {"lora", "locon", "lora+locon"}:
+        lora_enabled = args.mode in {"lora", "lora+locon"} and args.lora_rank > 0
+        locon_enabled = args.mode in {"locon", "lora+locon"} and args.locon_rank > 0
+
+        lora_targets = [t.strip() for t in args.lora_targets.split(",") if t.strip()]
+        locon_targets = [t.strip() for t in args.locon_targets.split(",") if t.strip()]
+
+        adapter_modes: list[str] = []
+        if lora_enabled:
+            adapter_modes.append("lora")
             print_rank0(f"Applying LoRA: rank={args.lora_rank}, alpha={args.lora_alpha}", rank)
             print_rank0(f"  Target modules: {lora_targets}", rank)
+        if locon_enabled:
+            validate_locon_targets(model, locon_targets)
+            adapter_modes.append("locon")
+            print_rank0(f"Applying Locon: rank={args.locon_rank}, alpha={args.locon_alpha}", rank)
+            print_rank0(f"  Target modules: {locon_targets}", rank)
+
+        if adapter_modes:
+            transfer_mode: str | list[str]
+            transfer_mode = adapter_modes[0] if len(adapter_modes) == 1 else adapter_modes
 
             transfer_config = TransferConfig(
-                mode="lora",
+                mode=transfer_mode,
                 lora_targets=lora_targets,
                 lora_rank=args.lora_rank,
                 lora_alpha=args.lora_alpha,
+                locon_targets=locon_targets,
+                locon_rank=args.locon_rank,
+                locon_alpha=args.locon_alpha,
                 new_heads=new_heads_config,
             )
             model = prepare_for_transfer(model, transfer_config)
-            # LoRA adapters + heads (heads already have requires_grad=True)
+            heads = {
+                modality: model.heads[modality]
+                for modality in modality_track_names
+            }
+            for modality, track_names in modality_track_names.items():
+                print_rank0(
+                    f"Created {modality} head with {len(track_names)} tracks "
+                    f"at resolutions {tuple(new_heads_config[modality]['resolutions'])}",
+                    rank,
+                )
+            # Adapter weights + the freshly registered heads.
             trainable_params = get_adapter_params(model)
             for head in heads.values():
                 trainable_params.extend(list(head.parameters()))
         else:
-            # LoRA rank 0 means just train heads
+            # Adapter rank 0 means just train heads
             for head in heads.values():
                 trainable_params.extend(list(head.parameters()))
             transfer_config = TransferConfig(mode="linear", new_heads=new_heads_config)
-            print_rank0("Mode: lora (rank=0, heads only)", rank)
+            print_rank0(f"Mode: {args.mode} (adapter rank=0, heads only)", rank)
 
     elif args.mode == "full":
         # All parameters trainable (model was not frozen above)
         trainable_params = list(model.parameters())
-        # Delta checkpoints don't make sense for full mode (all weights change)
-        if args.save_delta:
-            print_rank0("Warning: --save-delta ignored for --mode full (all weights trained)", rank)
+        # Embed TransferConfig so checkpoints are self-describing at load time
+        # (head names, modalities, resolutions). --save-delta is rejected at
+        # parse time because delta checkpoints cannot capture trunk updates.
+        transfer_config = TransferConfig(mode="full", new_heads=new_heads_config)
         print_rank0("Mode: full (all parameters trainable)", rank)
 
     else:
@@ -858,8 +1354,8 @@ def create_model(
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
         print_rank0("Model wrapped with DistributedDataParallel", rank)
 
-    # Get head references from GPU model
-    model_module = model.module if isinstance(model, DDP) else model
+    # Get head references from the underlying model before optional compile.
+    model_module = unwrap_training_model(model)
     heads = {modality: model_module.heads[modality] for modality in heads}
 
     # Optionally compile
@@ -868,13 +1364,14 @@ def create_model(
         import torch._inductor.config as inductor_config
         inductor_config.group_fusion = False
         model = torch.compile(model)
+        model_module = unwrap_training_model(model)
 
     # Count parameters
     n_trainable = sum(p.numel() for p in trainable_params)
     n_total = sum(p.numel() for p in model_module.parameters())
     print_rank0(f"Trainable: {n_trainable:,} / {n_total:,} ({100*n_trainable/n_total:.2f}%)", rank)
 
-    return model, heads, trainable_params
+    return model, heads, trainable_params, transfer_config
 
 
 # =============================================================================
@@ -882,9 +1379,10 @@ def create_model(
 # =============================================================================
 
 
-def main() -> None:
+def main(args: argparse.Namespace | None = None) -> None:
     """Main training function."""
-    args = parse_args()
+    if args is None:
+        args = parse_args()
 
     # Setup distributed
     rank, world_size, local_rank, device = setup_distributed()
@@ -923,6 +1421,23 @@ def main() -> None:
     # Create datasets
     train_dataset, val_dataset, modality_track_names, modality_resolutions = create_datasets(args, rank)
 
+    # Optional rich track metadata (overrides BigWig stems with parquet names
+    # and embeds the catalog into checkpoints / exported delta weights).
+    modality_track_names, track_metadata_rows = load_track_metadata_for_finetune(
+        args.track_metadata, modality_track_names, rank, organism=args.organism,
+    )
+
+    # Track identity embedded into every checkpoint/delta save below. Defined
+    # once and spread as **metadata_kwargs so a new save site cannot silently
+    # drop the embedded metadata.
+    metadata_kwargs = dict(
+        track_names=modality_track_names,
+        modality=args.modalities,
+        resolutions=modality_resolutions,
+        track_metadata=track_metadata_rows,
+        organism=args.organism,
+    )
+
     # Build resolution weights per modality.
     # encoder-only mode always operates at 128bp (encoder output resolution).
     resolution_weights_per_modality: dict[str, dict[int, float]] = {}
@@ -942,7 +1457,8 @@ def main() -> None:
         args.num_workers,
         world_size,
         rank,
-        is_multimodal=args.is_multimodal,
+        is_multimodal=True,  # Always multimodal now
+        sequence_parallel_mode=args.sequence_parallel,
     )
     print_rank0(f"Train batches: {len(train_loader):,}, Val batches: {len(val_loader):,}", rank)
 
@@ -956,12 +1472,13 @@ def main() -> None:
                 args.train_bed,
                 sequence_length=args.sequence_length,
                 max_samples=args.track_means_samples,
+                strand_pair_groups=args.modality_strand_pairs.get(modality),
             )
             print(f"  {modality}: mean={modality_track_means[modality].mean():.4f}")
     modality_track_means = broadcast_object(modality_track_means, src=0)
 
     # Create model
-    model, heads, trainable_params = create_model(
+    model, heads, trainable_params, transfer_config = create_model(
         args,
         modality_track_names,
         modality_track_means,
@@ -971,7 +1488,54 @@ def main() -> None:
         world_size,
         local_rank,
     )
-    model_module = model.module if isinstance(model, DDP) else model
+    model_module = unwrap_training_model(model)
+
+    # Build per-modality strand-channel masks for the gene LFC loss (B3.2).
+    # Empty dict when gene_loss_weight is 0; populated only for modalities
+    # whose strand info was supplied (today: rna_seq via --track-strands or
+    # the YAML strand field). Each mask is `[2, 1, C]` and lives on `device`.
+    gene_strand_channel_masks: dict[str, torch.Tensor] = {}
+    if args.gene_loss_weight > 0:
+        from alphagenome_pytorch.training import _build_strand_channel_mask
+        for modality, strands in args.modality_strands.items():
+            gene_strand_channel_masks[modality] = (
+                _build_strand_channel_mask(strands).to(device)
+            )
+
+    # Per-modality gene_loss_weights dict. Today only rna_seq receives a
+    # non-zero entry; other modalities are absent from the dict and the
+    # training loop's `gene_loss_weights.get(modality, 0.0)` returns 0.0.
+    gene_loss_weights: dict[str, float] = {}
+    if args.gene_loss_weight > 0:
+        gene_loss_weights["rna_seq"] = args.gene_loss_weight
+
+    # Sequence parallelism setup
+    sequence_parallel = None
+    if args.sequence_parallel:
+        if world_size == 1:
+            print_rank0(
+                "Warning: --sequence-parallel requires multiple GPUs. Running with single GPU.",
+                rank,
+            )
+        else:
+            sequence_parallel = SequenceParallelism(
+                overlap_highres=args.overlap_highres,
+                overlap_lowres=args.overlap_highres // 128,
+            )
+            overlap_lowres = args.overlap_highres // 128
+            print_rank0(
+                f"Sequence parallelism enabled: overlap_highres={args.overlap_highres}, "
+                f"overlap_lowres={overlap_lowres}",
+                rank,
+            )
+
+    # Only include transfer_config in checkpoints when one exists, so loaders
+    # can cleanly distinguish "no config saved" from "config was None".
+    transfer_config_kwargs = (
+        {"transfer_config": transfer_config_to_dict(transfer_config)}
+        if transfer_config is not None
+        else {}
+    )
 
     # Optimizer
     optimizer = torch.optim.AdamW(
@@ -1040,9 +1604,12 @@ def main() -> None:
         "modality_resolutions": {m: list(r) for m, r in modality_resolutions.items()},
         "track_names": modality_track_names,
         "pretrained_weights": args.pretrained_weights,
-        "lora_rank": args.lora_rank if args.mode == "lora" else None,
-        "lora_alpha": args.lora_alpha if args.mode == "lora" else None,
-        "lora_targets": args.lora_targets if args.mode == "lora" else None,
+        "lora_rank": args.lora_rank if args.mode in ("lora", "lora+locon") else None,
+        "lora_alpha": args.lora_alpha if args.mode in ("lora", "lora+locon") else None,
+        "lora_targets": args.lora_targets if args.mode in ("lora", "lora+locon") else None,
+        "locon_rank": args.locon_rank if args.mode in ("locon", "lora+locon") else None,
+        "locon_alpha": args.locon_alpha if args.mode in ("locon", "lora+locon") else None,
+        "locon_targets": args.locon_targets if args.mode in ("locon", "lora+locon") else None,
         "head_init_scheme": args.head_init_scheme,
         "epochs": args.epochs,
         "batch_size": args.batch_size,
@@ -1086,22 +1653,38 @@ def main() -> None:
     current_epoch = start_epoch
 
     def _save_preempt():
-        """Save preemption checkpoint."""
-        if is_main_process(rank):
+        """Save preemption checkpoint, honoring --save-delta / --no-full-checkpoint."""
+        if not (is_main_process(rank) and not args.no_save_checkpoints):
+            return
+        last_completed = max(0, current_epoch - 1)
+        if not args.no_full_checkpoint:
             save_checkpoint(
                 path=output_dir / "checkpoint_preempt.pth",
-                epoch=max(0, current_epoch - 1),  # Last completed epoch
+                epoch=last_completed,
                 model=model_module,
                 optimizer=optimizer,
                 val_loss=best_val_loss,
-                track_names=modality_track_names,
-                modality=args.modalities,
-                resolutions=modality_resolutions,
+                **metadata_kwargs,
                 scheduler=scheduler,
                 best_val_loss=best_val_loss,
                 wandb_run_id=logger.wandb_run_id,
+                **transfer_config_kwargs,
             )
             print(f"Preemption checkpoint saved to {output_dir / 'checkpoint_preempt.pth'}")
+        if args.save_delta and transfer_config is not None:
+            save_delta_checkpoint(
+                path=output_dir / "checkpoint_preempt.delta.pth",
+                model=model_module,
+                config=transfer_config,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                epoch=last_completed,
+                val_loss=best_val_loss,
+                best_val_loss=best_val_loss,
+                **metadata_kwargs,
+                wandb_run_id=logger.wandb_run_id,
+            )
+            print(f"Preemption delta checkpoint saved to {output_dir / 'checkpoint_preempt.delta.pth'}")
 
     handler = setup_preemption_handler(_save_preempt, rank, world_size)
 
@@ -1111,15 +1694,23 @@ def main() -> None:
     print_rank0("=" * 60, rank)
 
     # Freeze backbone (use torch.no_grad) when no backbone params need gradients.
-    # - linear-probe: only heads train
-    # - encoder-only: only heads train (backbone always frozen; uses encoder_only forward)
-    # - lora with rank=0: only heads train (no LoRA adapters)
-    # - lora with rank>0: LoRA adapters need gradients, can't freeze
+    # - linear-probe / encoder-only: only heads train
+    # - lora / locon / lora+locon with all adapter ranks == 0: only heads train
+    # - adapter modes with active adapters: adapters need gradients, can't freeze
     # - full: all params need gradients
+    has_active_adapters = (
+        (args.mode in ("lora", "lora+locon") and args.lora_rank > 0)
+        or (args.mode in ("locon", "lora+locon") and args.locon_rank > 0)
+    )
     frozen_backbone = args.mode in ("linear-probe", "encoder-only") or (
-        args.mode == "lora" and args.lora_rank == 0
+        args.mode in ("lora", "locon", "lora+locon") and not has_active_adapters
     )
     encoder_only = args.mode == "encoder-only"
+    # Forward at the fine-tune's organism so mouse data uses the mouse trunk
+    # embedding. Fine-tuned heads are single-organism (num_organisms=1, see
+    # create_model) and organism-agnostic — they always use slot 0 — so the
+    # organism index only selects the trunk embedding, not a head weight slot.
+    organism_index = organism_index_from_args(args)
 
     try:
         for epoch in range(start_epoch, args.epochs + 1):
@@ -1135,7 +1726,41 @@ def main() -> None:
                 torch.cuda.empty_cache()
 
             # Training
-            if args.is_multimodal:
+            if args.sequence_parallel and sequence_parallel is not None:
+                # Sequence parallel training (distributes sequence across GPUs)
+                train_loss, per_modality_train_loss = train_epoch_sequence_parallel(
+                    model=model,
+                    heads=heads,
+                    train_loader=train_loader,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    device=device,
+                    modality_weights=args.modality_weight_dict,
+                    resolution_weights=resolution_weights_per_modality,
+                    positional_weight=args.positional_weight,
+                    count_weight=args.count_weight,
+                    sequence_parallel=sequence_parallel,
+                    epoch=epoch,
+                    log_every=args.log_every,
+                    use_amp=use_amp,
+                    accumulation_steps=args.gradient_accumulation_steps,
+                    frozen_backbone=frozen_backbone,
+                    num_segments=args.num_segments,
+                    min_segment_size=args.min_segment_size,
+                    train_sampler=train_sampler,
+                    rank=rank,
+                    world_size=world_size,
+                    max_grad_norm=args.max_grad_norm,
+                    profile_batches=args.profile_batches if epoch == start_epoch else 0,
+                    log_fn=logger.log_step if is_main_process(rank) else None,
+                    encoder_only=encoder_only,
+                    gene_loss_weights=gene_loss_weights,
+                    gene_cross_track_weight=args.gene_cross_track_weight,
+                    strand_channel_masks=gene_strand_channel_masks,
+                    organism=organism_index,
+                )
+            else:
+                # Standard multimodal training (uses multihead functions)
                 train_loss, per_modality_train_loss = train_epoch_multihead(
                     model=model,
                     heads=heads,
@@ -1161,34 +1786,10 @@ def main() -> None:
                     profile_batches=args.profile_batches if epoch == start_epoch else 0,
                     log_fn=logger.log_step if is_main_process(rank) else None,
                     encoder_only=encoder_only,
-                )
-            else:
-                # Single modality: use the standard train_epoch_ddp
-                primary_modality = args.modalities[0]
-                train_loss = train_epoch_ddp(
-                    model=model,
-                    head=heads[primary_modality],
-                    train_loader=train_loader,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    device=device,
-                    resolution_weights=resolution_weights_per_modality[primary_modality],
-                    positional_weight=args.positional_weight,
-                    count_weight=args.count_weight,
-                    epoch=epoch,
-                    log_every=args.log_every,
-                    use_amp=use_amp,
-                    accumulation_steps=args.gradient_accumulation_steps,
-                    frozen_backbone=frozen_backbone,
-                    train_sampler=train_sampler,
-                    rank=rank,
-                    world_size=world_size,
-                    max_grad_norm=args.max_grad_norm,
-                    num_segments=args.num_segments,
-                    min_segment_size=args.min_segment_size,
-                    profile_batches=args.profile_batches if epoch == start_epoch else 0,
-                    log_fn=logger.log_step if is_main_process(rank) else None,
-                    encoder_only=encoder_only,
+                    gene_loss_weights=gene_loss_weights,
+                    gene_cross_track_weight=args.gene_cross_track_weight,
+                    strand_channel_masks=gene_strand_channel_masks,
+                    organism=organism_index,
                 )
 
             if handler.preempted:
@@ -1196,43 +1797,25 @@ def main() -> None:
                 handler.save_and_exit()
                 break
 
-            # Validation
-            if args.is_multimodal:
-                val_loss, val_metrics = validate_multihead(
-                    model=model,
-                    heads=heads,
-                    val_loader=val_loader,
-                    device=device,
-                    modality_weights=args.modality_weight_dict,
-                    resolution_weights=resolution_weights_per_modality,
-                    positional_weight=args.positional_weight,
-                    count_weight=args.count_weight,
-                    use_amp=use_amp,
-                    num_segments=args.num_segments,
-                    min_segment_size=args.min_segment_size,
-                    compute_pearson=True,
-                    rank=rank,
-                    world_size=world_size,
-                    encoder_only=encoder_only,
-                )
-            else:
-                primary_modality = args.modalities[0]
-                val_loss, val_metrics = validate_ddp(
-                    model=model,
-                    head=heads[primary_modality],
-                    val_loader=val_loader,
-                    device=device,
-                    resolution_weights=resolution_weights_per_modality[primary_modality],
-                    positional_weight=args.positional_weight,
-                    count_weight=args.count_weight,
-                    use_amp=use_amp,
-                    num_segments=args.num_segments,
-                    min_segment_size=args.min_segment_size,
-                    compute_pearson=True,
-                    rank=rank,
-                    world_size=world_size,
-                    encoder_only=encoder_only,
-                )
+            # Validation (always use multihead since we always have multimodal dataset format now)
+            val_loss, val_metrics = validate_multihead(
+                model=model,
+                heads=heads,
+                val_loader=val_loader,
+                device=device,
+                modality_weights=args.modality_weight_dict,
+                resolution_weights=resolution_weights_per_modality,
+                positional_weight=args.positional_weight,
+                count_weight=args.count_weight,
+                use_amp=use_amp,
+                num_segments=args.num_segments,
+                min_segment_size=args.min_segment_size,
+                compute_pearson=True,
+                rank=rank,
+                world_size=world_size,
+                encoder_only=encoder_only,
+                organism=organism_index,
+            )
 
             # Synchronize CUDA to ensure all validation ops complete before next epoch
             if torch.cuda.is_available():
@@ -1244,9 +1827,9 @@ def main() -> None:
             # Print epoch summary
             if is_main_process(rank):
                 summary = f"Epoch {epoch}: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}"
-                if args.is_multimodal:
-                    for mod, mod_loss in per_modality_train_loss.items():
-                        summary += f", {mod}_train={mod_loss:.4f}"
+                # Always print per-modality losses (we always have multimodal dataset format now)
+                for mod, mod_loss in per_modality_train_loss.items():
+                    summary += f", {mod}_train={mod_loss:.4f}"
                 for key, val in val_metrics.items():
                     if key.endswith("_values") or key.endswith("_std"):
                         continue
@@ -1268,26 +1851,30 @@ def main() -> None:
             logger.log_epoch(epoch, train_loss, val_loss, current_lr, is_best, extra, histograms)
 
             # Save checkpoints
-            if is_main_process(rank):
+            if is_main_process(rank) and not args.no_save_checkpoints:
+                # Delta saves require a transfer_config (full mode now also
+                # builds one, so this only skips the delta write in legacy
+                # paths where transfer_config is None).
+                write_delta = args.save_delta and transfer_config is not None
+                write_full = not args.no_full_checkpoint
+
                 if is_best:
                     best_val_loss = val_loss
-                    save_checkpoint(
-                        path=output_dir / "best_model.pth",
-                        epoch=epoch,
-                        model=model_module,
-                        optimizer=optimizer,
-                        val_loss=val_loss,
-                        track_names=modality_track_names,
-                        modality=args.modalities,
-                        resolutions=modality_resolutions,
-                        scheduler=scheduler,
-                        best_val_loss=best_val_loss,
-                        wandb_run_id=logger.wandb_run_id,
-                    )
-                    print(f"  Saved best model (val_loss={val_loss:.4f})")
-
-                    # Save delta checkpoint (adapter + head weights only)
-                    if args.save_delta and transfer_config is not None:
+                    if write_full:
+                        save_checkpoint(
+                            path=output_dir / "best_model.pth",
+                            epoch=epoch,
+                            model=model_module,
+                            optimizer=optimizer,
+                            val_loss=val_loss,
+                            **metadata_kwargs,
+                            scheduler=scheduler,
+                            best_val_loss=best_val_loss,
+                            wandb_run_id=logger.wandb_run_id,
+                            **transfer_config_kwargs,
+                        )
+                        print(f"  Saved best model (val_loss={val_loss:.4f})")
+                    if write_delta:
                         save_delta_checkpoint(
                             path=output_dir / "best_model.delta.pth",
                             model=model_module,
@@ -1297,26 +1884,38 @@ def main() -> None:
                             epoch=epoch,
                             val_loss=val_loss,
                             best_val_loss=best_val_loss,
-                            track_names=modality_track_names,
-                            modality=args.modalities,
-                            resolutions=modality_resolutions,
+                            **metadata_kwargs,
+                            wandb_run_id=logger.wandb_run_id,
                         )
-                        print(f"  Saved delta checkpoint (adapter + head weights)")
+                        print(f"  Saved best delta checkpoint (val_loss={val_loss:.4f})")
 
                 if epoch % args.save_every == 0:
-                    save_checkpoint(
-                        path=output_dir / f"checkpoint_epoch{epoch}.pth",
-                        epoch=epoch,
-                        model=model_module,
-                        optimizer=optimizer,
-                        val_loss=val_loss,
-                        track_names=modality_track_names,
-                        modality=args.modalities,
-                        resolutions=modality_resolutions,
-                        scheduler=scheduler,
-                        best_val_loss=best_val_loss,
-                        wandb_run_id=logger.wandb_run_id,
-                    )
+                    if write_full:
+                        save_checkpoint(
+                            path=output_dir / f"checkpoint_epoch{epoch}.pth",
+                            epoch=epoch,
+                            model=model_module,
+                            optimizer=optimizer,
+                            val_loss=val_loss,
+                            **metadata_kwargs,
+                            scheduler=scheduler,
+                            best_val_loss=best_val_loss,
+                            wandb_run_id=logger.wandb_run_id,
+                            **transfer_config_kwargs,
+                        )
+                    if write_delta:
+                        save_delta_checkpoint(
+                            path=output_dir / f"checkpoint_epoch{epoch}.delta.pth",
+                            model=model_module,
+                            config=transfer_config,
+                            optimizer=optimizer,
+                            scheduler=scheduler,
+                            epoch=epoch,
+                            val_loss=val_loss,
+                            best_val_loss=best_val_loss,
+                            **metadata_kwargs,
+                            wandb_run_id=logger.wandb_run_id,
+                        )
 
             barrier()
 
@@ -1326,6 +1925,15 @@ def main() -> None:
         logger.finish()
         handler.unregister()
         cleanup_distributed()
+
+    # Export transfer config if requested
+    if args.export_transfer_config and transfer_config is not None and is_main_process(rank):
+        import json
+        config_path = Path(args.export_transfer_config)
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(config_path, "w") as f:
+            json.dump(transfer_config_to_dict(transfer_config), f, indent=2)
+        print(f"Exported TransferConfig to {config_path}")
 
     print_rank0(f"\nTraining complete! Best val_loss: {best_val_loss:.4f}", rank)
     print_rank0(f"Output: {output_dir}", rank)

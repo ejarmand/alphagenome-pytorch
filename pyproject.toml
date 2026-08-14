@@ -11,8 +11,12 @@ requires-python = ">=3.12"
 dependencies = [
     "torch>=2.0.0",
     "numpy",
-    "safetensors"
+    "safetensors",
+    "huggingface_hub",
 ]
+
+[project.scripts]
+agt = "alphagenome_pytorch.cli:main"
 
 [project.optional-dependencies]
 test = [
@@ -47,12 +51,19 @@ finetuning = [
     "pandas",
     "tqdm",
     "pyfaidx",
+    "tensorflow",
 ]
 scoring = [
     "pyfaidx",
     "pandas",
     "tqdm",
     "pyranges",
+    "alphagenome",
+]
+serving = [
+    "grpcio",
+    "pandas",
+    "pyfaidx",
     "alphagenome",
 ]
 docs = [
@@ -71,6 +82,7 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = ["-v", "--strict-markers"]
+
 markers = [
     "unit: Unit tests (no external dependencies)",
     "integration: Integration tests with full model (PyTorch only, no JAX required)",
@@ -84,6 +96,11 @@ markers = [
 
 [tool.hatch.version]
 source = "vcs"
+
+[tool.hatch.build]
+artifacts = [
+    "src/alphagenome_pytorch/data/*.parquet",
+]
 
 [tool.hatch.build.hooks.vcs]
 version-file = "src/alphagenome_pytorch/_version.py"
