@@ -16,6 +16,9 @@ from pathlib import Path
 from typing import Any
 
 import torch
+# Preload Dynamo/Triton before TensorFlow is imported lazily for TFRecord I/O.
+# Loading these native runtimes in the opposite order can segfault on Cuica.
+import torch._dynamo
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
