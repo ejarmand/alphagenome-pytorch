@@ -115,6 +115,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Random seed for head initialization and cached-data augmentation.",
+    )
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument(
@@ -143,6 +149,15 @@ def parse_args() -> argparse.Namespace:
         default=500,
         help=(
             "Warmup optimizer steps. Set 0 to disable warmup."
+        ),
+    )
+    parser.add_argument(
+        "--warmup-fraction",
+        type=float,
+        default=None,
+        help=(
+            "Warmup as a fraction of estimated optimizer steps. When set, "
+            "this overrides --warmup-steps."
         ),
     )
     parser.add_argument(
@@ -1905,6 +1920,7 @@ def run_epoch(
     grad_norm_count = torch.tensor(0.0, device=device)
     grad_norm_max = torch.tensor(0.0, device=device)
     metric_stats: dict[str, torch.Tensor] = {}
+    modality_loss_sums: dict[str, torch.Tensor] = {}
     strand_pair_by_modality = {
         modality: torch.as_tensor(indices, dtype=torch.long, device=device)
         for modality, indices in loader.dataset.strand_pair_by_modality.items()
@@ -2013,6 +2029,9 @@ def run_epoch(
             )
             loss = loss + modality_loss
             loss_by_modality[modality] = float(modality_loss.detach())
+            if modality not in modality_loss_sums:
+                modality_loss_sums[modality] = torch.tensor(0.0, device=device)
+            modality_loss_sums[modality] += modality_loss.detach()
             if modality not in metric_stats:
                 metric_stats[modality] = new_metric_stats(device)
             update_metric_stats(
@@ -2068,6 +2087,8 @@ def run_epoch(
         dist.all_reduce(grad_norm_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(grad_norm_count, op=dist.ReduceOp.SUM)
         dist.all_reduce(grad_norm_max, op=dist.ReduceOp.MAX)
+        for modality_loss_sum in modality_loss_sums.values():
+            dist.all_reduce(modality_loss_sum, op=dist.ReduceOp.SUM)
         for stats in metric_stats.values():
             dist.all_reduce(stats, op=dist.ReduceOp.SUM)
 
@@ -2076,6 +2097,10 @@ def run_epoch(
     if training and grad_norm_count.item() > 0:
         grad_metrics["grad_norm"] = (grad_norm_sum / grad_norm_count).item()
         grad_metrics["grad_norm_max"] = grad_norm_max.item()
+    for modality, modality_loss_sum in modality_loss_sums.items():
+        metrics[f"{modality}_loss"] = (
+            modality_loss_sum / total_steps.clamp_min(1)
+        ).item()
     for modality, stats in metric_stats.items():
         modality_metrics = compute_regression_metrics(stats)
         metrics[f"{modality}_pearson_r"] = modality_metrics["pearson_r"]
@@ -2231,10 +2256,15 @@ def main() -> None:
         )
     torch.backends.cuda.matmul.allow_tf32 = True
     rank, world_size, local_rank, device = setup_torchrun(args.device)
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
     wandb_run = None
     try:
         modalities = resolve_modalities(args)
         print_rank0(f"Distributed: rank={rank} world_size={world_size}", rank)
+        print_rank0(f"Seed: {args.seed}", rank)
 
         train_dataset = create_tfr_dataset(
             args.data_dir,
@@ -2418,6 +2448,7 @@ def main() -> None:
                 world_size=world_size,
                 augment_rc=args.augment_rc,
                 shuffle_files=True,
+                seed=args.seed,
             )
             val_dataset = CachedEmbeddingTFRecordDataset(
                 embedding_cache_dir,
@@ -2531,7 +2562,19 @@ def main() -> None:
             args.gradient_accumulation_steps,
             args.max_train_steps,
         )
-        warmup_steps = resolve_warmup_steps(args.warmup_steps, total_optimizer_steps)
+        if args.warmup_fraction is not None:
+            if not 0.0 <= args.warmup_fraction <= 1.0:
+                raise ValueError(
+                    "warmup_fraction must be between 0 and 1, got "
+                    f"{args.warmup_fraction}"
+                )
+            warmup_steps = math.ceil(
+                total_optimizer_steps * args.warmup_fraction
+            )
+        else:
+            warmup_steps = resolve_warmup_steps(
+                args.warmup_steps, total_optimizer_steps
+            )
         scheduler = create_lr_scheduler(
             optimizer,
             warmup_steps=warmup_steps,
@@ -2551,7 +2594,15 @@ def main() -> None:
             rank,
         )
 
-        run_name = args.run_name or datetime.now().strftime("%Y%m%d_%H%M%S")
+        if args.run_name is not None:
+            run_name = args.run_name
+        else:
+            generated_run_name = (
+                datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                if is_main_process(rank)
+                else None
+            )
+            run_name = broadcast_object(generated_run_name, src=0)
         output_dir = args.output_dir / run_name
         if is_main_process(rank):
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -2608,10 +2659,12 @@ def main() -> None:
             "val_num_workers": args.val_num_workers,
             "prefetch_n": args.prefetch_n,
             "epochs": args.epochs,
+            "seed": args.seed,
             "lr": args.lr,
             "lr_schedule": args.lr_schedule,
             "warmup_steps": warmup_steps,
             "warmup_steps_arg": args.warmup_steps,
+            "warmup_fraction": args.warmup_fraction,
             "estimated_optimizer_steps": total_optimizer_steps,
             "gradient_accumulation_steps": args.gradient_accumulation_steps,
             "weight_decay": args.weight_decay,
@@ -2633,7 +2686,6 @@ def main() -> None:
             (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
         wandb_run = create_wandb_run(args, rank, run_name, metadata)
 
-        best_val = float("inf")
         for epoch in range(1, args.epochs + 1):
             print_rank0(f"Epoch {epoch}/{args.epochs}", rank)
             train_loss, train_metrics, train_grad_metrics = run_epoch(
@@ -2708,13 +2760,6 @@ def main() -> None:
                     heads_model,
                     epoch_metadata,
                 )
-                if val_loss < best_val:
-                    best_val = val_loss
-                    save_checkpoint(
-                        output_dir / "best_heads.pt",
-                        heads_model,
-                        epoch_metadata,
-                    )
     finally:
         finish_wandb(wandb_run)
         cleanup_torchrun()
