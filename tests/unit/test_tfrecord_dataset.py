@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from types import SimpleNamespace
 
 import numpy as np
@@ -35,6 +36,7 @@ from scripts.finetune_tfr_heads import (
     forward_heads,
     modality_types_from_target_rows,
     new_metric_stats,
+    parse_args,
     switch_reverse_predictions,
     update_metric_stats,
 )
@@ -862,6 +864,63 @@ def test_poisson_multinomial_loss_alias_runs():
     )
 
     assert torch.isfinite(loss)
+
+
+def test_tfr_finetune_cli_accepts_loss_segmentation_controls(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "finetune_tfr_heads.py",
+            "--data-dir",
+            "dataset",
+            "--num-segments",
+            "4",
+            "--min-segment-size",
+            "16",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.num_segments == 4
+    assert args.min_segment_size == 16
+
+
+def test_tfr_finetune_loss_uses_requested_segment_size():
+    class IdentityScaleHead(torch.nn.Module):
+        def scale(self, target, organism_idx, resolution, channels_last=True):
+            del organism_idx, resolution
+            assert channels_last
+            return target
+
+    pred = torch.ones(1, 4, 1)
+    target = torch.tensor([[[4.0], [0.0], [0.0], [0.0]]])
+    loss_kwargs = {
+        "loss_name": "poisson-multinomial",
+        "head": IdentityScaleHead(),
+        "organism_idx": torch.zeros(1, dtype=torch.long),
+        "target_resolution": 128,
+        "positional_weight": 1.0,
+        "count_weight": 0.0,
+    }
+
+    two_segment_loss = compute_loss(
+        pred,
+        target,
+        num_segments=2,
+        min_segment_size=None,
+        **loss_kwargs,
+    )
+    minimum_limited_loss = compute_loss(
+        pred,
+        target,
+        num_segments=2,
+        min_segment_size=4,
+        **loss_kwargs,
+    )
+
+    assert two_segment_loss.item() == pytest.approx(math.log(2), rel=1e-6)
+    assert minimum_limited_loss.item() == pytest.approx(math.log(4), rel=1e-6)
 
 
 def test_regression_metric_stats_accumulate_pearson_and_r2():

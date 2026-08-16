@@ -32,7 +32,10 @@ from alphagenome_pytorch.extensions.finetuning.tfrecord_dataset import (
     BaskervilleMultiTFRecordDataset,
     collate_tfr_multimodal,
 )
-from alphagenome_pytorch.extensions.finetuning.training import create_lr_scheduler
+from alphagenome_pytorch.extensions.finetuning.training import (
+    _compute_multinomial_resolution,
+    create_lr_scheduler,
+)
 from alphagenome_pytorch.extensions.finetuning.transfer import load_trunk, remove_all_heads
 from alphagenome_pytorch.heads import EMBEDDING_128BP_DIM
 from alphagenome_pytorch.losses import multinomial_loss
@@ -166,6 +169,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--positional-weight", type=float, default=5.0)
     parser.add_argument("--count-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--num-segments",
+        type=int,
+        default=8,
+        help="Target number of contiguous segments for the multinomial loss.",
+    )
+    parser.add_argument(
+        "--min-segment-size",
+        type=int,
+        default=None,
+        help="Optional minimum number of output bins per multinomial-loss segment.",
+    )
     parser.add_argument("--track-means-samples", type=int, default=16)
     parser.add_argument(
         "--cell-embedding-dim",
@@ -1691,6 +1706,8 @@ def compute_loss(
     target_resolution: int,
     positional_weight: float,
     count_weight: float,
+    num_segments: int = 8,
+    min_segment_size: int | None = None,
 ) -> torch.Tensor:
     if loss_name == "mse":
         return F.mse_loss(pred, target)
@@ -1720,7 +1737,11 @@ def compute_loss(
             y_pred=pred,
             y_true=target_scaled,
             mask=mask,
-            multinomial_resolution=max(1, pred.shape[1] // 8),
+            multinomial_resolution=_compute_multinomial_resolution(
+                pred.shape[1],
+                num_segments,
+                min_segment_size,
+            ),
             positional_weight=positional_weight,
             count_weight=count_weight,
             channels_last=True,
@@ -2007,6 +2028,8 @@ def run_epoch(
                 target_resolution=args.target_resolution,
                 positional_weight=args.positional_weight,
                 count_weight=args.count_weight,
+                num_segments=args.num_segments,
+                min_segment_size=args.min_segment_size,
             )
             loss = loss + modality_loss
             loss_by_modality[modality] = float(modality_loss.detach())
@@ -2591,6 +2614,8 @@ def main() -> None:
             "crop_bins_128bp": train_dataset.prediction_crop_128bp,
             "target_length_128bp": train_dataset.output_length_128bp,
             "loss": args.loss,
+            "num_segments": args.num_segments,
+            "min_segment_size": args.min_segment_size,
             "organism_idx": args.organism_idx,
             "pretrained_weights": str(pretrained_weights),
             "pretrained_weights_source": (
