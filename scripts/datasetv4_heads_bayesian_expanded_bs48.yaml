@@ -1,0 +1,103 @@
+name: datasetv4-heads-bayesian-expanded-bs48-seed-20260815
+description: >-
+  Follow-up Bayesian optimization of DatasetV4 RNA+ATAC head fine-tuning.
+  Uses one GPU per trial, 20 epochs per trial, one fixed seed, a fixed local
+  batch size of 48, and expanded weight-decay, positional-weight, and cell
+  embedding-dimension ranges informed by earlier sweeps.
+
+entity: ejarmand
+project: rna_alphagenome_dog10k
+program: alphagenome-pytorch-tfr/scripts/finetune_tfr_heads.py
+method: bayes
+run_cap: 1000
+
+metric:
+  name: val/mean_pearson_r
+  goal: maximize
+
+parameters:
+  lr:
+    distribution: log_uniform_values
+    min: 0.0005
+    max: 0.2
+  weight-decay:
+    distribution: log_uniform_values
+    min: 0.03
+    max: 0.5
+  positional-weight:
+    distribution: uniform
+    min: 25.0
+    max: 200.0
+  cell-embedding-dim:
+    distribution: int_uniform
+    min: 16
+    max: 128
+  batch-size:
+    value: 48
+  count-weight:
+    value: 1.0
+
+command:
+  - ${env}
+  - PYTHONFAULTHANDLER=1
+  - PYTHONUNBUFFERED=1
+  - pixi
+  - run
+  - torchrun
+  - --standalone
+  - --nproc_per_node=1
+  - ${program}
+  - --data-dir
+  - data/DatasetV4_rna_atac_norm150M_meansqrt
+  - --pretrained-weights
+  - weights/model_fold_1.safetensors
+  - --modality
+  - rna
+  - --modality
+  - atac
+  - --target-resolution
+  - "128"
+  - --pooling
+  - mean
+  - --organism-idx
+  - "0"
+  - --precompute-embeddings
+  - --embedding-cache-dir
+  - ${envvar:ALPHAGENOME_EMBEDDING_CACHE}
+  - --embedding-cache-dtype
+  - bfloat16
+  - --embedding-cache-chunk-size
+  - "16"
+  - --augment-rc
+  - --track-means-samples
+  - "2787"
+  - --loss
+  - poisson-multinomial
+  - --epochs
+  - "20"
+  - --seed
+  - "20260815"
+  - --gradient-accumulation-steps
+  - "1"
+  - --warmup-fraction
+  - "0.05"
+  - --lr-schedule
+  - constant
+  - --num-workers
+  - "2"
+  - --val-num-workers
+  - "0"
+  - --device
+  - cuda
+  - --dtype
+  - bfloat16
+  - --output-dir
+  - finetuning_output/tfr_multitask_v4_bayesian_bs48_sweeps
+  - --wandb
+  - --wandb-project
+  - rna_alphagenome_dog10k
+  - --wandb-entity
+  - ejarmand
+  - --wandb-tags
+  - datasetv4,bayesian-expanded,bs48,seed-20260815
+  - ${args}
