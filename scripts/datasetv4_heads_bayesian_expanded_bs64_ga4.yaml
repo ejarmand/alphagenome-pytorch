@@ -1,9 +1,10 @@
-name: datasetv4-heads-bayesian-expanded-bs48-seed-20260815
+name: datasetv4-heads-bayesian-expanded-bs64-ga4-seed-20260815
 description: >-
   Follow-up Bayesian optimization of DatasetV4 RNA+ATAC head fine-tuning.
   Uses one GPU per trial, 20 epochs per trial, one fixed seed, a fixed local
-  batch size of 48, and expanded weight-decay, positional-weight, and cell
-  embedding-dimension ranges informed by earlier sweeps.
+  batch size of 64, four gradient-accumulation steps, and expanded
+  weight-decay, positional-weight, and cell embedding-dimension ranges
+  informed by earlier sweeps.
 
 entity: ejarmand
 project: rna_alphagenome_dog10k
@@ -33,7 +34,7 @@ parameters:
     min: 16
     max: 128
   batch-size:
-    value: 48
+    value: 64
   count-weight:
     value: 1.0
 
@@ -78,7 +79,7 @@ command:
   - --seed
   - "20260815"
   - --gradient-accumulation-steps
-  - "1"
+  - "4"
   - --warmup-fraction
   - "0.05"
   - --lr-schedule
@@ -92,12 +93,12 @@ command:
   - --dtype
   - bfloat16
   - --output-dir
-  - finetuning_output/tfr_multitask_v4_bayesian_bs48_sweeps
+  - finetuning_output/tfr_multitask_v4_bayesian_bs64_ga4_sweeps
   - --wandb
   - --wandb-project
   - rna_alphagenome_dog10k
   - --wandb-entity
   - ejarmand
   - --wandb-tags
-  - datasetv4,bayesian-expanded,bs48,seed-20260815
+  - datasetv4,bayesian-expanded,bs64,ga4,seed-20260815
   - ${args}

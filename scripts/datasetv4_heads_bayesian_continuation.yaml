@@ -1,4 +1,4 @@
-name: datasetv4-heads-bayesian-continuation-1000-seed-20260815
+name: datasetv4-heads-bayesian-stage2-wide-1000-seed-20260815
 description: >-
   Bayesian continuation of DatasetV4 RNA+ATAC head fine-tuning, initialized
   from all completed runs in sweep 43fvcxhv. Uses one GPU per trial, 20 epochs
