@@ -2681,11 +2681,14 @@ def main() -> None:
             ),
             "embedding_cache_dtype": args.embedding_cache_dtype,
             "embedding_cache_chunk_size": args.embedding_cache_chunk_size,
+            "best_checkpoint_metric": "val/mean_pearson_r",
         }
         if is_main_process(rank):
             (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
         wandb_run = create_wandb_run(args, rank, run_name, metadata)
 
+        best_val_mean_pearson_r = float("-inf")
+        best_epoch = None
         for epoch in range(1, args.epochs + 1):
             print_rank0(f"Epoch {epoch}/{args.epochs}", rank)
             train_loss, train_metrics, train_grad_metrics = run_epoch(
@@ -2732,6 +2735,17 @@ def main() -> None:
                 f"val/{key}": value
                 for key, value in val_metrics.items()
             })
+            current_val_mean_pearson_r = val_metrics.get("mean_pearson_r", float("nan"))
+            is_best = (
+                math.isfinite(current_val_mean_pearson_r)
+                and current_val_mean_pearson_r > best_val_mean_pearson_r
+            )
+            if is_best:
+                best_val_mean_pearson_r = current_val_mean_pearson_r
+                best_epoch = epoch
+            if best_epoch is not None:
+                epoch_log["best/val_mean_pearson_r"] = best_val_mean_pearson_r
+                epoch_log["best/epoch"] = best_epoch
             log_wandb(wandb_run, epoch_log, step=epoch)
             print_rank0(
                 " ".join(
@@ -2754,12 +2768,29 @@ def main() -> None:
                     "val_loss": val_loss,
                     "train_metrics": train_metrics,
                     "val_metrics": val_metrics,
+                    "best_checkpoint_metric": "val/mean_pearson_r",
+                    "best_val_mean_pearson_r": best_val_mean_pearson_r,
+                    "best_epoch": best_epoch,
                 }
                 save_checkpoint(
                     output_dir / "last_heads.pt",
                     heads_model,
-                    epoch_metadata,
+                    {**epoch_metadata, "checkpoint_kind": "last"},
                 )
+                if is_best:
+                    save_checkpoint(
+                        output_dir / "best_heads.pt",
+                        heads_model,
+                        {**epoch_metadata, "checkpoint_kind": "best"},
+                    )
+                    print_rank0(
+                        (
+                            "Saved best_heads.pt "
+                            f"epoch={epoch} "
+                            f"val_mean_pearson_r={best_val_mean_pearson_r:.6f}"
+                        ),
+                        rank,
+                    )
     finally:
         finish_wandb(wandb_run)
         cleanup_torchrun()
