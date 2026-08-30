@@ -106,3 +106,19 @@ After all 260 chunks finish, merge them with:
 ```bash
 bash alphagenome-pytorch-tfr/scripts/bash_launch/merge_chr1_512kb_genevar_10k.sh
 ```
+
+## Delta reverse array
+
+The Delta Slurm array launcher processes tail chunks 0259 through 0180 while
+Cuica continues from the beginning. Array task 0 maps to chunk 0259 and later
+tasks move backward. At most two one-GPU tasks run concurrently:
+
+```bash
+mkdir -p ~/worknvme_algenome/logs/chr1_512kb_reverse
+cd ~/worknvme_algenome
+sbatch alphagenome-pytorch/scripts/bash_launch/run_chr1_512kb_genevar_delta_reverse.slurm
+```
+
+Do not merge on Delta. Copy the validated tail `chunk_*.h5` files into Cuica's
+canonical `results/inference/chr1_512kb/chunks_10k` directory, then use the
+normal status and merge commands on Cuica.
