@@ -42,8 +42,8 @@ fasta=$input_dir/GCF_011100685.1_UU_Cfam_GSD_1.0_genomic.fna
 inference_script=$repo/scripts/inference/inference_geneVar.py
 validator=$repo/scripts/inference/validate_genevar_shard.py
 
-output_dir=$root/results/inference/chr1_512kb/chunks_10k
-app_log_dir=$root/logs/chr1_512kb_reverse/app
+output_dir=$root/inference
+inference_log_dir=$root/logs/chr1_512kb_reverse/inference
 
 start=$((chunk * chunk_size))
 end=$((start + chunk_size))
@@ -57,9 +57,9 @@ printf -v end_id '%07d' "$end"
 stem=chunk_${chunk_id}_rows_${start_id}_${end_id}
 output=$output_dir/${stem}.h5
 partial=${output}.partial
-app_log=$app_log_dir/${stem}.log
+inference_log=$inference_log_dir/${stem}.log
 
-mkdir -p "$output_dir" "$app_log_dir"
+mkdir -p "$output_dir" "$inference_log_dir"
 
 for required_file in \
   "$python_bin" "$checkpoint" "$pretrained_weights" \
@@ -115,7 +115,7 @@ PYTHONUNBUFFERED=1 \
   --start "$start" \
   --end "$end" \
   --out "$partial" \
-  2>&1 | tee "$app_log"
+  2>&1 | tee "$inference_log"
 
 "$python_bin" "$validator" "$partial" \
   --expected-start "$start" --expected-end "$end"

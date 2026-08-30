@@ -116,9 +116,20 @@ tasks move backward. At most two one-GPU tasks run concurrently:
 ```bash
 mkdir -p ~/worknvme_agenome/inference_needed_data
 mkdir -p ~/worknvme_agenome/logs/chr1_512kb_reverse
+mkdir -p ~/worknvme_agenome/inference
 cd ~/worknvme_agenome
 sbatch alphagenome-pytorch/scripts/bash_launch/run_chr1_512kb_genevar_delta_reverse.slurm
 ```
+
+Delta writes completed `chunk_*.h5` shards directly to:
+
+```text
+~/worknvme_agenome/inference
+```
+
+Python inference logs go to
+`~/worknvme_agenome/logs/chr1_512kb_reverse/inference`. Slurm's standard
+output and error logs remain in `~/worknvme_agenome/logs/chr1_512kb_reverse`.
 
 The launcher reads all transferred model and reference inputs from:
 
@@ -160,6 +171,7 @@ GCF_011100685.1_UU_Cfam_GSD_1.0_genomic.fna
 GCF_011100685.1_UU_Cfam_GSD_1.0_genomic.fna.fai
 ```
 
-Do not merge on Delta. Copy the validated tail `chunk_*.h5` files into Cuica's
-canonical `results/inference/chr1_512kb/chunks_10k` directory, then use the
-normal status and merge commands on Cuica.
+Do not merge on Delta. Copy the validated tail `chunk_*.h5` files from Delta's
+`~/worknvme_agenome/inference` directory into Cuica's canonical
+`results/inference/chr1_512kb/chunks_10k` directory. Then use the normal status
+and merge commands on Cuica.
