@@ -114,9 +114,50 @@ Cuica continues from the beginning. Array task 0 maps to chunk 0259 and later
 tasks move backward. At most two one-GPU tasks run concurrently:
 
 ```bash
-mkdir -p ~/worknvme_algenome/logs/chr1_512kb_reverse
-cd ~/worknvme_algenome
+mkdir -p ~/worknvme_agenome/inference_needed_data
+mkdir -p ~/worknvme_agenome/logs/chr1_512kb_reverse
+cd ~/worknvme_agenome
 sbatch alphagenome-pytorch/scripts/bash_launch/run_chr1_512kb_genevar_delta_reverse.slurm
+```
+
+The launcher reads all transferred model and reference inputs from:
+
+```text
+~/worknvme_agenome/inference_needed_data
+```
+
+From Cuica, create that directory and transfer the inputs with:
+
+```bash
+DELTA_LOGIN=lxu13@login.delta.ncsa.illinois.edu
+
+ssh "$DELTA_LOGIN" \
+  'mkdir -p "$HOME/worknvme_agenome/inference_needed_data"'
+
+rsync -avP --partial \
+  /home/lilx/projects/doggenetics/alphagenome_rna/finetuning_output/tfr_multitask_v4_final/model_final_datasetv4_200ep/best_heads.pt \
+  /home/lilx/projects/doggenetics/alphagenome_rna/weights/model_fold_1.safetensors \
+  /home/datasets/deep_learning/application/lilx_dog/inference_chr1_512kb/dog10k_chr1_512kb_exon_nearest_gene.sites.vcf.gz \
+  /home/datasets/deep_learning/application/lilx_dog/inference_chr1_512kb/dog10k_chr1_512kb_exon_nearest_gene.variant_gene_map.tsv.gz \
+  /home/datasets/deep_learning/application/lilx_dog/ref/UU_Cfam_GSD_1.0/GCF_011100685.1_UU_Cfam_GSD_1.0_genomic.gtf.gz \
+  /home/lilx/projects/doggenetics/ref/genomes/ncbi_dataset/ncbi_dataset/data/GCF_011100685.1/GCF_011100685.1_UU_Cfam_GSD_1.0_genomic.fna \
+  /home/lilx/projects/doggenetics/ref/genomes/ncbi_dataset/ncbi_dataset/data/GCF_011100685.1/GCF_011100685.1_UU_Cfam_GSD_1.0_genomic.fna.fai \
+  "$DELTA_LOGIN:worknvme_agenome/inference_needed_data/"
+
+ssh "$DELTA_LOGIN" \
+  'ls -lh "$HOME/worknvme_agenome/inference_needed_data"'
+```
+
+That directory must contain:
+
+```text
+best_heads.pt
+model_fold_1.safetensors
+dog10k_chr1_512kb_exon_nearest_gene.sites.vcf.gz
+dog10k_chr1_512kb_exon_nearest_gene.variant_gene_map.tsv.gz
+GCF_011100685.1_UU_Cfam_GSD_1.0_genomic.gtf.gz
+GCF_011100685.1_UU_Cfam_GSD_1.0_genomic.fna
+GCF_011100685.1_UU_Cfam_GSD_1.0_genomic.fna.fai
 ```
 
 Do not merge on Delta. Copy the validated tail `chunk_*.h5` files into Cuica's

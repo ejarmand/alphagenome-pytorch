@@ -28,17 +28,17 @@ if (( chunk < first_chunk || chunk > last_chunk )); then
   exit 1
 fi
 
-root=${ALPHAGENOME_DELTA_ROOT:-$HOME/worknvme_algenome}
+root=${ALPHAGENOME_DELTA_ROOT:-$HOME/worknvme_agenome}
 repo=$root/alphagenome-pytorch
 python_bin=${ALPHAGENOME_PYTHON:-/work/nvme/bgup/lxu13/doggenetics/alphagenome/envs/alphagenome/bin/python}
 
-checkpoint=$root/finetuning_output/tfr_multitask_v4_final/model_final_datasetv4_200ep/best_heads.pt
-pretrained_weights=$root/weights/model_fold_1.safetensors
-input_dir=$root/inference_chr1_512kb
+input_dir=$root/inference_needed_data
+checkpoint=$input_dir/best_heads.pt
+pretrained_weights=$input_dir/model_fold_1.safetensors
 vcf=$input_dir/dog10k_chr1_512kb_exon_nearest_gene.sites.vcf.gz
 variant_gene_map=$input_dir/dog10k_chr1_512kb_exon_nearest_gene.variant_gene_map.tsv.gz
-gtf=$root/ref/UU_Cfam_GSD_1.0/GCF_011100685.1_UU_Cfam_GSD_1.0_genomic.gtf.gz
-fasta=$root/ref/GCF_011100685.1_UU_Cfam_GSD_1.0_genomic.fna
+gtf=$input_dir/GCF_011100685.1_UU_Cfam_GSD_1.0_genomic.gtf.gz
+fasta=$input_dir/GCF_011100685.1_UU_Cfam_GSD_1.0_genomic.fna
 inference_script=$repo/scripts/inference/inference_geneVar.py
 validator=$repo/scripts/inference/validate_genevar_shard.py
 
