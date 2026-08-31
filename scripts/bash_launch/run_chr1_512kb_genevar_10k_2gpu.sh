@@ -9,12 +9,18 @@ input_dir=/home/datasets/deep_learning/application/lilx_dog/inference_chr1_512kb
 vcf=$input_dir/dog10k_chr1_512kb_exon_nearest_gene.sites.vcf.gz
 variant_gene_map=$input_dir/dog10k_chr1_512kb_exon_nearest_gene.variant_gene_map.tsv.gz
 manifest=$input_dir/chr1_512kb_genevar_10k_shards.tsv
+max_chunk=${MAX_CHUNK:-259}
 gtf=/home/datasets/deep_learning/application/lilx_dog/ref/UU_Cfam_GSD_1.0/GCF_011100685.1_UU_Cfam_GSD_1.0_genomic.gtf.gz
 fasta=/home/lilx/projects/doggenetics/ref/genomes/ncbi_dataset/ncbi_dataset/data/GCF_011100685.1/GCF_011100685.1_UU_Cfam_GSD_1.0_genomic.fna
 inference_script=alphagenome-pytorch-tfr/scripts/inference/inference_geneVar.py
 validator=alphagenome-pytorch-tfr/scripts/inference/validate_genevar_shard.py
 
 cd "$project_dir"
+
+if [[ ! "$max_chunk" =~ ^[0-9]+$ ]] || (( max_chunk > 259 )); then
+  echo "MAX_CHUNK must be an integer from 0 through 259; got: $max_chunk" >&2
+  exit 1
+fi
 
 for required_file in \
   "$checkpoint" "$pretrained_weights" "$vcf" "$variant_gene_map" \
@@ -35,9 +41,14 @@ run_worker() {
   local gpu=$1
   local completed=0
   local skipped=0
+  local chunk_number
 
   while IFS=$'\t' read -r chunk_id start end row_count gpu_slot output log; do
-    if [[ "$chunk_id" == "chunk_id" || "$gpu_slot" != "$gpu" ]]; then
+    if [[ "$chunk_id" == "chunk_id" ]]; then
+      continue
+    fi
+    chunk_number=$((10#$chunk_id))
+    if (( chunk_number > max_chunk )) || [[ "$gpu_slot" != "$gpu" ]]; then
       continue
     fi
 
@@ -104,7 +115,7 @@ run_worker() {
   echo "GPU $gpu worker finished; new chunks=$completed skipped chunks=$skipped"
 }
 
-echo "Starting resumable 10,000-variant inference workers"
+echo "Starting resumable 10,000-variant inference workers through chunk $max_chunk"
 run_worker 0 &
 worker_gpu0=$!
 run_worker 1 &

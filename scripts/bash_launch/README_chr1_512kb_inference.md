@@ -101,6 +101,17 @@ pixi run python \
   --manifest /home/datasets/deep_learning/application/lilx_dog/inference_chr1_512kb/chr1_512kb_genevar_10k_shards.tsv
 ```
 
+When Delta owns chunks 0180 through 0259, cap Cuica at chunk 0179:
+
+```bash
+MAX_CHUNK=179 \
+  bash alphagenome-pytorch-tfr/scripts/bash_launch/run_chr1_512kb_genevar_10k_2gpu.sh
+```
+
+The cap applies when the launcher starts. It does not change an existing
+launcher process. Completed shards remain valid and are skipped after a
+restart.
+
 After all 260 chunks finish, merge them with:
 
 ```bash
