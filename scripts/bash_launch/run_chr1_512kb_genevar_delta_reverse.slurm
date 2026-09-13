@@ -14,12 +14,22 @@
 
 set -euo pipefail
 
-# The 80 array tasks cover canonical chunks 0259 through 0180. Array task 0
-# starts at the end of chromosome 1, and later task IDs move backward.
-last_chunk=259
-first_chunk=180
+# By default, the 80 array tasks cover canonical chunks 0259 through 0180.
+# DELTA_LAST_CHUNK and DELTA_FIRST_CHUNK can select another inclusive reverse
+# range; array task 0 starts at DELTA_LAST_CHUNK and later tasks move backward.
+last_chunk=${DELTA_LAST_CHUNK:-259}
+first_chunk=${DELTA_FIRST_CHUNK:-180}
 total_rows=2591838
 chunk_size=10000
+
+if [[ ! "$last_chunk" =~ ^[0-9]+$ || ! "$first_chunk" =~ ^[0-9]+$ ]]; then
+  echo "Chunk bounds must be non-negative integers: first=$first_chunk last=$last_chunk" >&2
+  exit 1
+fi
+if (( first_chunk > last_chunk || last_chunk > 259 )); then
+  echo "Invalid inclusive chunk range: first=$first_chunk last=$last_chunk" >&2
+  exit 1
+fi
 
 task_id=${SLURM_ARRAY_TASK_ID:?SLURM_ARRAY_TASK_ID is not set}
 chunk=$((last_chunk - task_id))
@@ -75,6 +85,7 @@ export PYTHONPATH=$repo/src${PYTHONPATH:+:$PYTHONPATH}
 
 echo "Host: $(hostname)"
 echo "Slurm job: ${SLURM_JOB_ID}; array task: $task_id"
+echo "Assigned reverse range: $last_chunk through $first_chunk"
 echo "Reverse chunk: $chunk_id; rows [$start, $end)"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-not-set}"
 "$python_bin" -c \

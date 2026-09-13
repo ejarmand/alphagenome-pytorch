@@ -182,6 +182,24 @@ GCF_011100685.1_UU_Cfam_GSD_1.0_genomic.fna
 GCF_011100685.1_UU_Cfam_GSD_1.0_genomic.fna.fai
 ```
 
+To give Delta 18 additional chunks, 0179 through 0162 inclusive, submit a new
+array with explicit bounds. Array task 0 maps to 0179 and task 17 maps to 0162:
+
+```bash
+cd ~/worknvme_agenome
+DELTA_JOB_2=$(
+  sbatch --parsable \
+    --array=0-17%2 \
+    --export=ALL,DELTA_LAST_CHUNK=179,DELTA_FIRST_CHUNK=162 \
+    alphagenome-pytorch/scripts/bash_launch/run_chr1_512kb_genevar_delta_reverse.slurm
+)
+echo "Delta array job: $DELTA_JOB_2"
+```
+
+The launcher validates and skips an already-completed shard, so a small amount
+of overlap with Cuica is safe. When copying results back, use
+`rsync --ignore-existing` so an existing valid Cuica shard is not overwritten.
+
 Do not merge on Delta. Copy the validated tail `chunk_*.h5` files from Delta's
 `~/worknvme_agenome/inference` directory into Cuica's canonical
 `results/inference/chr1_512kb/chunks_10k` directory. Then use the normal status
